@@ -9,6 +9,7 @@ package org.elasticsearch.xpack.encryption;
 import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.common.settings.SecureString;
 import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.xpack.encryption.spi.EncryptedData;
 
 import java.util.function.Supplier;
@@ -20,12 +21,32 @@ import java.util.function.Supplier;
  * <p>The active password id and password material are sourced from a {@link Supplier} so that secure-settings reloads are reflected
  * automatically: the supplier is re-evaluated on every call.
  */
-final class PasswordPekEncryption implements ProjectEncryptionKeyMetadata.PekEncryption {
+public final class PasswordPekEncryption implements ProjectEncryptionKeyMetadata.PekEncryption {
 
     private final Supplier<Settings> settingsSupplier;
+    private final ProjectEncryptionKeyMetadata.GatewayKeys gatewayKeys = new ProjectEncryptionKeyMetadata.GatewayKeys();
 
     PasswordPekEncryption(Supplier<Settings> settingsSupplier) {
         this.settingsSupplier = settingsSupplier;
+    }
+
+    @Override
+    public ProjectEncryptionKeyMetadata.GatewayKeys gatewayKeys() {
+        return gatewayKeys;
+    }
+
+    /** Returns whether this node can write the key to its disk. */
+    boolean canWrapForDisk() {
+        return ProjectEncryptionKeyPasswordSettings.canWrapForDisk(settingsSupplier.get());
+    }
+
+    /**
+     * Returns the keys for {@code activeKeyId} from this node's disk, unwrapped with its password, or {@code null} if it holds no copy of
+     * that key. Throws if it holds a copy but cannot unwrap it.
+     */
+    @Nullable
+    ProjectEncryptionKeyMetadata gatewayKeysFor(String activeKeyId) {
+        return ProjectEncryptionKeyMetadata.unwrapGatewayKeys(activeKeyId, this);
     }
 
     @Override

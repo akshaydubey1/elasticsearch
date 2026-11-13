@@ -82,6 +82,11 @@ final class ProjectEncryptionKeyPasswordSettings {
         return id != null && id.isEmpty() == false && PASSWORD.getConcreteSetting(PASSWORD_PREFIX + id).exists(settings);
     }
 
+    /** Returns whether {@code settings} let a node write the key to disk: an active password id and its password are configured. */
+    static boolean canWrapForDisk(Settings settings) {
+        return hasPassword(settings, getActivePasswordId(settings));
+    }
+
     /**
      * Returns a {@link Settings} that merges all non-secure entries from {@code settings} with a durable in-memory snapshot of the
      * encryption-related secure settings read from the same source. The returned instance does not hold a reference to the original

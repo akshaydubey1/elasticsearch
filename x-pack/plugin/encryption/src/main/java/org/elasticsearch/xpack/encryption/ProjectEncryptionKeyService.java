@@ -87,9 +87,7 @@ class ProjectEncryptionKeyService implements AesGcmEncryptionService.KeyProvider
      * and the matching password material is present in the current settings snapshot.
      */
     boolean canWrapForDisk() {
-        Settings s = settingsSupplier.get();
-        String id = ProjectEncryptionKeyPasswordSettings.getActivePasswordId(s);
-        return ProjectEncryptionKeyPasswordSettings.hasPassword(s, id);
+        return ProjectEncryptionKeyPasswordSettings.canWrapForDisk(settingsSupplier.get());
     }
 
     /**
@@ -149,6 +147,11 @@ class ProjectEncryptionKeyService implements AesGcmEncryptionService.KeyProvider
         if (state.blocks().hasGlobalBlock(GatewayService.STATE_NOT_RECOVERED_BLOCK)) {
             return null;
         }
+        return metadataIn(state);
+    }
+
+    @Nullable
+    ProjectEncryptionKeyMetadata metadataIn(ClusterState state) {
         ProjectMetadata project = state.metadata().projects().get(projectResolver.getProjectId());
         return project == null ? null : project.custom(ProjectEncryptionKeyMetadata.TYPE);
     }
