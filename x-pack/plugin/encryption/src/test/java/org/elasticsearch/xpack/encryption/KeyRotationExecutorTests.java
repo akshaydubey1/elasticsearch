@@ -14,6 +14,7 @@ import org.elasticsearch.cluster.metadata.ProjectMetadata;
 import org.elasticsearch.cluster.node.DiscoveryNodeUtils;
 import org.elasticsearch.cluster.node.DiscoveryNodes;
 import org.elasticsearch.cluster.project.DefaultProjectResolver;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.Tuple;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.xpack.encryption.ProjectEncryptionKeyMetadata.KeyEntry;
@@ -62,7 +63,7 @@ public class KeyRotationExecutorTests extends ESTestCase {
         String newKeyId = ProjectEncryptionKeyMetadata.generateKeyId();
         long generatedAt = System.currentTimeMillis();
         Tuple<ClusterState, Void> result = executor.executeTask(
-            new KeyRotationCoordinator.InstallKeyTask(newKeyId, randomKey(), PASSWORD_ID, generatedAt, Set.of()),
+            new KeyRotationCoordinator.InstallKeyTask(newKeyId, randomKey(), PASSWORD_ID, generatedAt, null),
             state
         );
 
@@ -83,10 +84,7 @@ public class KeyRotationExecutorTests extends ESTestCase {
             NO_OP_ENCRYPTION
         );
         ClusterState state = stateWith(existing);
-        Tuple<ClusterState, Void> result = executor.executeTask(
-            new KeyRotationCoordinator.InstallKeyTask(ProjectEncryptionKeyMetadata.generateKeyId(), randomKey(), PASSWORD_ID, 0L, Set.of()),
-            state
-        );
+        Tuple<ClusterState, Void> result = executor.executeTask(installTask(ProjectEncryptionKeyMetadata.generateKeyId(), null), state);
         assertSame(state, result.v1());
     }
 
@@ -272,7 +270,7 @@ public class KeyRotationExecutorTests extends ESTestCase {
         assertEquals(keyId, metadataOf(executor.executeTask(installTask(keyId, Set.of("ready", "joined")), state).v1()).getActiveKeyId());
     }
 
-    private static KeyRotationCoordinator.InstallKeyTask installTask(String keyId, Set<String> readyNodeIds) {
+    private static KeyRotationCoordinator.InstallKeyTask installTask(String keyId, @Nullable Set<String> readyNodeIds) {
         return new KeyRotationCoordinator.InstallKeyTask(keyId, randomKey(), PASSWORD_ID, 0L, readyNodeIds);
     }
 

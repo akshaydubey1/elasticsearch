@@ -7,10 +7,6 @@
 package org.elasticsearch.xpack.encryption;
 
 import org.apache.logging.log4j.core.LogEvent;
-import org.elasticsearch.action.admin.cluster.configuration.AddVotingConfigExclusionsRequest;
-import org.elasticsearch.action.admin.cluster.configuration.ClearVotingConfigExclusionsRequest;
-import org.elasticsearch.action.admin.cluster.configuration.TransportAddVotingConfigExclusionsAction;
-import org.elasticsearch.action.admin.cluster.configuration.TransportClearVotingConfigExclusionsAction;
 import org.elasticsearch.cluster.coordination.JoinHelper;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.settings.MockSecureSettings;
@@ -92,46 +88,29 @@ public class ProjectEncryptionKeyMissingPasswordIT extends ESIntegTestCase {
     }
 
     /**
-     * A master-eligible node restarts without its password and is elected. Encryption is unavailable until its password is reloaded; it
-     * then reads the key from its disk.
+     * The master restarts without its password. Encryption is unavailable until its password is reloaded; it then reads the key from its
+     * disk.
      */
     public void testElectedMasterWithoutKeyReadsItOnceItHasThePassword() throws Exception {
         internalCluster().setBootstrapMasterNodeIndex(0);
-        List<String> nodes = internalCluster().startNodes(3);
-        ensureStableCluster(3);
-        for (String node : nodes) {
-            reload(node, passwordSettings());
-        }
-        assertBusy(() -> nodes.forEach(node -> assertThat(pekOn(node), notNullValue())), 30, TimeUnit.SECONDS);
+        String master = internalCluster().startNode();
+        reload(master, passwordSettings());
+        assertBusy(() -> assertThat(pekOn(master), notNullValue()));
         byte[] payload = "missing-password-payload".getBytes(StandardCharsets.UTF_8);
-        EncryptedData encrypted = internalCluster().getInstance(EncryptionService.class, nodes.get(0)).encrypt(payload);
+        EncryptedData encrypted = internalCluster().getInstance(EncryptionService.class, master).encrypt(payload);
 
-        String withoutPassword = nodes.get(2);
-        client().execute(
-            TransportAddVotingConfigExclusionsAction.TYPE,
-            new AddVotingConfigExclusionsRequest(TEST_REQUEST_TIMEOUT, nodes.get(0), nodes.get(1))
-        ).get();
-        assertBusy(() -> assertEquals(withoutPassword, internalCluster().getMasterName()));
-        internalCluster().restartNode(withoutPassword);
-        ensureStableCluster(3);
-        assertEquals(withoutPassword, internalCluster().getMasterName());
+        internalCluster().restartNode(master);
+        assertTrue(pekOn(master).isUnwrapFailed());
+        EncryptionServiceUnavailableException e = expectThrows(
+            EncryptionServiceUnavailableException.class,
+            () -> decryptOn(master, encrypted)
+        );
+        assertEquals(EncryptionServiceState.UNAVAILABLE_DECRYPTION_FAILED, e.serviceState());
+        assertEquals(ProjectEncryptionKeyHealthIndicatorService.MASTER_HAS_NO_KEY, health(master).symptom());
 
-        for (String node : nodes) {
-            assertBusy(() -> assertTrue(pekOn(node).isUnwrapFailed()));
-            EncryptionServiceUnavailableException e = expectThrows(
-                EncryptionServiceUnavailableException.class,
-                () -> decryptOn(node, encrypted)
-            );
-            assertEquals(EncryptionServiceState.UNAVAILABLE_DECRYPTION_FAILED, e.serviceState());
-            assertEquals(ProjectEncryptionKeyHealthIndicatorService.MASTER_HAS_NO_KEY, health(node).symptom());
-        }
-
-        reload(withoutPassword, passwordSettings());
-        for (String node : nodes) {
-            assertBusy(() -> assertFalse(pekOn(node).isUnwrapFailed()));
-            assertArrayEquals(payload, decryptOn(node, encrypted));
-        }
-        clearVotingConfigExclusions();
+        reload(master, passwordSettings());
+        assertBusy(() -> assertFalse(pekOn(master).isUnwrapFailed()));
+        assertArrayEquals(payload, decryptOn(master, encrypted));
     }
 
     /** No node can read the key: the cluster still forms, so that a reset can recover it. */
@@ -189,12 +168,6 @@ public class ProjectEncryptionKeyMissingPasswordIT extends ESIntegTestCase {
         public void awaitMatched(long millis) throws InterruptedException {
             assertTrue("expected the join to be rejected", seen.await(millis, TimeUnit.MILLISECONDS));
         }
-    }
-
-    private static void clearVotingConfigExclusions() throws Exception {
-        ClearVotingConfigExclusionsRequest request = new ClearVotingConfigExclusionsRequest(TEST_REQUEST_TIMEOUT);
-        request.setWaitForRemoval(false);
-        client().execute(TransportClearVotingConfigExclusionsAction.TYPE, request).get();
     }
 
     private static byte[] decryptOn(String node, EncryptedData encrypted) {

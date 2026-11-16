@@ -214,6 +214,11 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
         setup(state, now, rotationInterval, TimeValue.timeValueMinutes(1));
     }
 
+    /** Serializes {@code metadata} as for this node's disk, which records it as this node's copy of the key. */
+    private static void writeToDisk(ProjectEncryptionKeyMetadata metadata) {
+        metadata.toXContentChunked(new ToXContent.MapParams(Map.of(Metadata.CONTEXT_MODE_PARAM, Metadata.CONTEXT_MODE_GATEWAY)));
+    }
+
     /** A reset removes the key on every node, so this node no longer reports a copy of it on disk. */
     public void testResetForgetsThisNodesCopyOfTheKey() throws IOException {
         ProjectEncryptionKeyMetadata.GatewayKeys keys = new ProjectEncryptionKeyMetadata.GatewayKeys();
@@ -225,8 +230,7 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
             Map.of(),
             pekEncryption
         );
-        // writing to disk records this node's copy
-        existing.toXContentChunked(new ToXContent.MapParams(Map.of(Metadata.CONTEXT_MODE_PARAM, Metadata.CONTEXT_MODE_GATEWAY)));
+        writeToDisk(existing);
         assertEquals(Boolean.TRUE, keys.holdsKeys());
         setup(clusterStateWith(existing, false), 0L, TimeValue.timeValueDays(30));
 
@@ -285,8 +289,7 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
         ProjectEncryptionKeyMetadata.GatewayKeys keys = new ProjectEncryptionKeyMetadata.GatewayKeys();
         pekEncryption = TestPekEncryption.onNode(NO_OP_ENCRYPTION, keys);
         byte[] keyBytes = randomKey();
-        new ProjectEncryptionKeyMetadata(Map.of("k1", new KeyEntry(keyBytes, 1L)), "k1", PASSWORD_ID, Map.of(), pekEncryption)
-            .toXContentChunked(new ToXContent.MapParams(Map.of(Metadata.CONTEXT_MODE_PARAM, Metadata.CONTEXT_MODE_GATEWAY)));
+        writeToDisk(new ProjectEncryptionKeyMetadata(Map.of("k1", new KeyEntry(keyBytes, 1L)), "k1", PASSWORD_ID, Map.of(), pekEncryption));
         ClusterState state = clusterStateWith(ProjectEncryptionKeyMetadata.degraded("k1", PASSWORD_ID, pekEncryption, "no key"), true);
         setup(state, 0L, TimeValue.timeValueDays(30));
 

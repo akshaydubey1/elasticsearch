@@ -10,10 +10,7 @@ import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.ActionRequest;
-import org.elasticsearch.action.ActionResponse;
 import org.elasticsearch.action.ActionRunnable;
-import org.elasticsearch.action.ActionType;
 import org.elasticsearch.action.support.RefCountingListener;
 import org.elasticsearch.client.internal.Client;
 import org.elasticsearch.cluster.ClusterChangedEvent;
@@ -34,7 +31,6 @@ import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.settings.Setting;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.concurrent.AbstractRunnable;
-import org.elasticsearch.common.util.concurrent.ThreadContext;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.core.Tuple;
@@ -484,38 +480,40 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
             submitInstall(passwordId, null);
             return;
         }
-        executeAsSystem(
-            TransportCanPersistKeyAction.TYPE,
-            new TransportCanPersistKeyAction.Request(nodes),
-            ActionListener.wrap(response -> {
-                TransportCanPersistKeyAction.NotReady notReady = response.notReady(nodes);
-                if (notReady.isEmpty()) {
-                    warnedNotReady.set(null);
-                    submitInstall(passwordId, response.readyNodeIds());
-                    return;
-                }
-                Set<String> withoutPassword = notReady.withoutPassword();
-                if (withoutPassword.isEmpty() == false && withoutPassword.equals(warnedNotReady.getAndSet(withoutPassword)) == false) {
-                    logger.warn(
-                        "project encryption key not installed yet: nodes {} cannot persist it. Configure [{}] and the matching [{}<id>]"
-                            + " secure setting on every master-eligible and data node and reload secure settings",
-                        withoutPassword,
-                        ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY,
-                        ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX
-                    );
-                }
-                if (notReady.unreachable().isEmpty() == false) {
-                    logger.debug(
-                        "project encryption key not installed yet: nodes {} did not report whether they can persist it",
-                        notReady.unreachable()
-                    );
-                }
-                retryInstallLater();
-            }, e -> {
-                logger.warn("failed to check whether every node can persist the project encryption key", e);
-                retryInstallLater();
-            })
-        );
+        ActionListener<TransportCanPersistKeyAction.Response> listener = ActionListener.wrap(response -> {
+            TransportCanPersistKeyAction.NotReady notReady = response.notReady(nodes);
+            if (notReady.isEmpty()) {
+                warnedNotReady.set(null);
+                submitInstall(passwordId, response.readyNodeIds());
+                return;
+            }
+            Set<String> withoutPassword = notReady.withoutPassword();
+            if (withoutPassword.isEmpty() == false && withoutPassword.equals(warnedNotReady.getAndSet(withoutPassword)) == false) {
+                logger.warn(
+                    "project encryption key not installed yet: nodes {} cannot persist it. Configure [{}] and the matching [{}<id>]"
+                        + " secure setting on every master-eligible and data node and reload secure settings",
+                    withoutPassword,
+                    ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY,
+                    ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX
+                );
+            }
+            if (notReady.unreachable().isEmpty() == false) {
+                logger.debug(
+                    "project encryption key not installed yet: nodes {} did not report whether they can persist it",
+                    notReady.unreachable()
+                );
+            }
+            retryInstallLater();
+        }, e -> {
+            logger.warn("failed to check whether every node can persist the project encryption key", e);
+            retryInstallLater();
+        });
+        // forked off the cluster applier thread, which must not call ClusterService#state() as nodes actions do
+        threadPool.generic().execute(ActionRunnable.wrap(listener, l -> {
+            try (var ignored = threadPool.getThreadContext().newEmptySystemContext()) {
+                client.execute(TransportCanPersistKeyAction.TYPE, new TransportCanPersistKeyAction.Request(nodes), l);
+            }
+        }));
     }
 
     private void releaseInstall() {
@@ -609,20 +607,6 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
                 );
             }
         });
-    }
-
-    private <Request extends ActionRequest, Response extends ActionResponse> void executeAsSystem(
-        ActionType<Response> action,
-        Request request,
-        ActionListener<Response> listener
-    ) {
-        threadPool.generic().execute(ActionRunnable.wrap(listener, l -> {
-            ThreadContext threadContext = threadPool.getThreadContext();
-            try (ThreadContext.StoredContext ignored = threadContext.stashContext()) {
-                threadContext.markAsSystemContext();
-                client.execute(action, request, l);
-            }
-        }));
     }
 
     private void submitBeginRotation() {
