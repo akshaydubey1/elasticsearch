@@ -43,7 +43,8 @@ import static org.hamcrest.Matchers.nullValue;
  * A master-eligible or data node that cannot persist the project encryption key cannot persist any cluster state, so once the key is
  * installed such a node is not allowed to join. Installing the key only once every such node can persist it is covered by
  * {@code MissingPasswordRolloutIT}. A node that cannot read the key on its disk still starts; if
- * it is elected master, it gets the key from another node, and if no node holds the key, a reset recovers the cluster.
+ * it is elected master, it reads the key from its disk once it has the password, and if no node can read the key, a reset recovers the
+ * cluster.
  *
  * <p>Passwords are added with a secure settings reload rather than at startup, so that a restart drops them.
  */
@@ -91,10 +92,10 @@ public class ProjectEncryptionKeyMissingPasswordIT extends ESIntegTestCase {
     }
 
     /**
-     * A master-eligible node restarts without its password and is elected. Encryption is unavailable until it can persist the key; it
-     * then gets the key from a node that holds it.
+     * A master-eligible node restarts without its password and is elected. Encryption is unavailable until its password is reloaded; it
+     * then reads the key from its disk.
      */
-    public void testElectedMasterWithoutKeyGetsItFromAnotherNode() throws Exception {
+    public void testElectedMasterWithoutKeyReadsItOnceItHasThePassword() throws Exception {
         internalCluster().setBootstrapMasterNodeIndex(0);
         List<String> nodes = internalCluster().startNodes(3);
         ensureStableCluster(3);

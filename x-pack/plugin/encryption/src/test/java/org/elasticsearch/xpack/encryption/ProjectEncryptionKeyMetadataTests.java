@@ -457,8 +457,8 @@ public class ProjectEncryptionKeyMetadataTests extends ChunkedToXContentDiffable
         assertThat("peer without local blob writes empty keys", peerBlob, containsString("\"keys\":{}"));
     }
 
-    /** A peer keeps writing, and can hand over, the copy it last wrote for the key-less master's active key. */
-    public void testPeerKeepsAndHandsOverItsCopyOfDegradedMastersActiveKey() throws IOException {
+    /** A peer keeps writing, and can still read, the copy it last wrote for the key-less master's active key. */
+    public void testPeerKeepsItsCopyOfDegradedMastersActiveKey() throws IOException {
         GatewayKeys peerKeys = new GatewayKeys();
         PekEncryption peer = TestPekEncryption.onNode(NO_OP_ENCRYPTION, peerKeys);
         byte[] k1 = randomPlaintextBytes();
@@ -486,9 +486,9 @@ public class ProjectEncryptionKeyMetadataTests extends ChunkedToXContentDiffable
         assertThat(persistedBlob, containsString(Base64.getEncoder().encodeToString(k2)));
         assertThat("peer blob retains handler_key_ids", persistedBlob, containsString("\"myhandler\""));
 
-        ProjectEncryptionKeyMetadata handedOver = ProjectEncryptionKeyMetadata.unwrapGatewayKeys("k2", peer);
-        assertEquals(Set.of("k1", "k2"), handedOver.getKeys().keySet());
-        assertArrayEquals(k2, handedOver.getKeys().get("k2").bytes());
+        ProjectEncryptionKeyMetadata readBack = ProjectEncryptionKeyMetadata.unwrapGatewayKeys("k2", peer);
+        assertEquals(Set.of("k1", "k2"), readBack.getKeys().keySet());
+        assertArrayEquals(k2, readBack.getKeys().get("k2").bytes());
         assertNull("no copy of another active key", ProjectEncryptionKeyMetadata.unwrapGatewayKeys("k1", peer));
     }
 

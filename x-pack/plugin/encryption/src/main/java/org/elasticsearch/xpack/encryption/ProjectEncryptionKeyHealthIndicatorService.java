@@ -94,11 +94,11 @@ class ProjectEncryptionKeyHealthIndicatorService implements HealthIndicatorServi
     static final Diagnosis.Definition DECRYPTION_FAILED_DEFINITION = new Diagnosis.Definition(
         NAME,
         "decryption_failed",
-        "The elected master could not decrypt the cluster state encryption key on its disk, and no other node has provided it yet.",
-        "The elected master gets the key from any node that holds it. If the elected master has no encryption password configured,"
-            + " configure cluster.state.encryption.active_password_id and the matching cluster.state.encryption.password.<id> on it"
-            + " and reload secure settings. If a node that holds the key is not in the cluster, start it. Only if no node holds the"
-            + " key, call POST /_encryption/_reset?accept_data_loss=true, which permanently deletes all encrypted data.",
+        "The elected master could not decrypt the cluster state encryption key on its disk.",
+        "Configure the password the key on the elected master's disk is wrapped with, as cluster.state.encryption.password.<id> with"
+            + " cluster.state.encryption.active_password_id, and reload secure settings; it then reads the key from its disk. If that"
+            + " password is lost, restart the master-eligible nodes so that a node that can read its copy is elected. Only if no node"
+            + " can, call POST /_encryption/_reset?accept_data_loss=true, which permanently deletes all encrypted data.",
         HELP_URL
     );
     static final Diagnosis.Definition MISSING_PASSWORD_DEFINITION = new Diagnosis.Definition(

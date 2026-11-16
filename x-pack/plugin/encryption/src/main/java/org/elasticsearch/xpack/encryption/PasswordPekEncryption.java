@@ -7,11 +7,13 @@
 package org.elasticsearch.xpack.encryption;
 
 import org.elasticsearch.ElasticsearchException;
+import org.elasticsearch.cluster.node.DiscoveryNodeRole;
 import org.elasticsearch.common.settings.SecureString;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.xpack.encryption.spi.EncryptedData;
 
+import java.util.Set;
 import java.util.function.Supplier;
 
 /**
@@ -37,6 +39,17 @@ public final class PasswordPekEncryption implements ProjectEncryptionKeyMetadata
     @Override
     public ProjectEncryptionKeyMetadata.GatewayKeys gatewayKeys() {
         return gatewayKeys;
+    }
+
+    /**
+     * Returns whether a node with {@code roles} writes cluster state to its own disk, and so must be able to wrap the key for disk. Mirrors
+     * {@link org.elasticsearch.gateway.GatewayMetaState}, which gives master-eligible and data nodes an on-disk persisted state, unless a
+     * {@link org.elasticsearch.plugins.ClusterCoordinationPlugin} supplies the persisted state; only serverless does, so {@code stateless}
+     * stands in for that.
+     */
+    static boolean writesClusterStateToDisk(Set<DiscoveryNodeRole> roles, boolean stateless) {
+        return stateless == false
+            && (roles.contains(DiscoveryNodeRole.MASTER_ROLE) || roles.stream().anyMatch(DiscoveryNodeRole::canContainData));
     }
 
     /** Returns whether this node can write the key to its disk. */

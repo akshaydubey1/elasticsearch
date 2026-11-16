@@ -64,13 +64,13 @@ public class EncryptionPlugin extends Plugin
     private final SetOnce<ProjectEncryptionKeyService> pekService = new SetOnce<>();
     private final SetOnce<ClusterService> clusterService = new SetOnce<>();
 
-    private final boolean persistsClusterState;
+    private final boolean writesClusterStateToDisk;
     private volatile Settings pekSettings;
 
     private final PasswordPekEncryption pekEncryption = new PasswordPekEncryption(() -> this.pekSettings);
 
     public EncryptionPlugin(Settings settings) {
-        this.persistsClusterState = KeyRotationCoordinator.persistsClusterState(
+        this.writesClusterStateToDisk = PasswordPekEncryption.writesClusterStateToDisk(
             DiscoveryNode.getRolesFromSettings(settings),
             DiscoveryNode.isStateless(settings)
         );
@@ -151,7 +151,7 @@ public class EncryptionPlugin extends Plugin
     @Override
     public synchronized void reload(Settings settings) {
         Settings updated = ProjectEncryptionKeyPasswordSettings.cloneSettings(settings);
-        if (persistsClusterState && clusterUsesKey()) {
+        if (writesClusterStateToDisk && clusterUsesKey()) {
             ProjectEncryptionKeyPasswordSettings.validateReload(
                 pekEncryption.canWrapForDisk(),
                 pekSettings,
@@ -166,7 +166,7 @@ public class EncryptionPlugin extends Plugin
         }
     }
 
-    // including while the elected master holds no key, since it gets the key back from other nodes
+    // including while the elected master holds no key, since the key can still be restored
     private boolean clusterUsesKey() {
         ProjectEncryptionKeyService service = pekService.get();
         ClusterService localClusterService = clusterService.get();
@@ -179,7 +179,7 @@ public class EncryptionPlugin extends Plugin
      */
     @Override
     public BiConsumer<DiscoveryNode, ClusterState> getJoinValidator() {
-        if (persistsClusterState == false) {
+        if (writesClusterStateToDisk == false) {
             return null;
         }
         return (node, state) -> {
@@ -220,8 +220,7 @@ public class EncryptionPlugin extends Plugin
     public Collection<ActionHandler> getActions() {
         return List.of(
             new ActionHandler(TransportEncryptionResetAction.TYPE, TransportEncryptionResetAction.class),
-            new ActionHandler(TransportCanPersistKeyAction.TYPE, TransportCanPersistKeyAction.class),
-            new ActionHandler(TransportFetchKeyAction.TYPE, TransportFetchKeyAction.class)
+            new ActionHandler(TransportCanPersistKeyAction.TYPE, TransportCanPersistKeyAction.class)
         );
     }
 

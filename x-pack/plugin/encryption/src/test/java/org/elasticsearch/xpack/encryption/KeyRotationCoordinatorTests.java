@@ -9,7 +9,6 @@ package org.elasticsearch.xpack.encryption;
 import org.apache.logging.log4j.Level;
 import org.elasticsearch.TransportVersion;
 import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.FailedNodeException;
 import org.elasticsearch.client.internal.Client;
 import org.elasticsearch.cluster.AbstractNamedDiffable;
 import org.elasticsearch.cluster.ClusterChangedEvent;
@@ -55,7 +54,6 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.function.UnaryOperator;
 
@@ -66,6 +64,7 @@ import static org.mockito.ArgumentMatchers.isA;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -128,42 +127,21 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
     private AtomicReference<Settings> settingsRef;
     private ThreadPool threadPool;
     private Predicate<DiscoveryNode> canPersist = node -> true;
-    private Function<DiscoveryNode, ProjectEncryptionKeyMetadata> keysOnDisk = node -> null;
-    private final AtomicInteger fetches = new AtomicInteger();
-    private String failFetchFrom;
 
-    /** Answers the node-level actions from {@link #canPersist} and {@link #keysOnDisk}, as the nodes would over transport. */
+    /** Answers the readiness check from {@link #canPersist}, as the nodes would over transport. */
     @SuppressWarnings("unchecked")
     private Client stubClient() {
         Client client = mock(Client.class);
         doAnswer(invocation -> {
             ActionListener<Object> listener = invocation.getArgument(2);
-            if (invocation.getArgument(1) instanceof TransportCanPersistKeyAction.Request request) {
-                listener.onResponse(
-                    new TransportCanPersistKeyAction.Response(
-                        CLUSTER_NAME,
-                        request.nodes().stream().map(n -> new TransportCanPersistKeyAction.NodeResponse(n, canPersist.test(n))).toList(),
-                        List.of()
-                    )
-                );
-            } else if (invocation.getArgument(1) instanceof TransportFetchKeyAction.Request request) {
-                fetches.incrementAndGet();
-                listener.onResponse(
-                    new TransportFetchKeyAction.Response(
-                        CLUSTER_NAME,
-                        request.nodes()
-                            .stream()
-                            .filter(n -> n.getId().equals(failFetchFrom) == false)
-                            .map(n -> new TransportFetchKeyAction.NodeResponse(n, keysOnDisk.apply(n)))
-                            .toList(),
-                        failFetchFrom == null
-                            ? List.of()
-                            : List.of(new FailedNodeException(failFetchFrom, "no answer", new IllegalStateException("disconnected")))
-                    )
-                );
-            } else {
-                throw new AssertionError("unexpected request " + invocation.getArgument(1));
-            }
+            TransportCanPersistKeyAction.Request request = invocation.getArgument(1);
+            listener.onResponse(
+                new TransportCanPersistKeyAction.Response(
+                    CLUSTER_NAME,
+                    request.nodes().stream().map(n -> new TransportCanPersistKeyAction.NodeResponse(n, canPersist.test(n))).toList(),
+                    List.of()
+                )
+            );
             return null;
         }).when(client).execute(any(), any(), any());
         return client;
@@ -302,18 +280,18 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
         assertEquals(Set.of("local", "other"), ((KeyRotationCoordinator.InstallKeyTask) install.getValue()).readyNodeIds());
     }
 
-    /** An elected master without the key gets it from another node, once per secure settings and set of nodes. */
-    public void testElectedMasterWithoutKeyRestoresItFromAnotherNode() {
+    /** An elected master without the key restores it from its own copy on disk, once per secure settings snapshot. */
+    public void testElectedMasterWithoutKeyRestoresItFromItsOwnDisk() {
+        ProjectEncryptionKeyMetadata.GatewayKeys keys = new ProjectEncryptionKeyMetadata.GatewayKeys();
+        pekEncryption = TestPekEncryption.onNode(NO_OP_ENCRYPTION, keys);
         byte[] keyBytes = randomKey();
-        keysOnDisk = node -> node.getId().equals("other")
-            ? new ProjectEncryptionKeyMetadata(Map.of("k1", new KeyEntry(keyBytes, 1L)), "k1", PASSWORD_ID, Map.of(), NO_OP_ENCRYPTION)
-            : null;
-        ClusterState state = clusterStateWith(ProjectEncryptionKeyMetadata.degraded("k1", PASSWORD_ID, NO_OP_ENCRYPTION, "no key"), true);
+        new ProjectEncryptionKeyMetadata(Map.of("k1", new KeyEntry(keyBytes, 1L)), "k1", PASSWORD_ID, Map.of(), pekEncryption)
+            .toXContentChunked(new ToXContent.MapParams(Map.of(Metadata.CONTEXT_MODE_PARAM, Metadata.CONTEXT_MODE_GATEWAY)));
+        ClusterState state = clusterStateWith(ProjectEncryptionKeyMetadata.degraded("k1", PASSWORD_ID, pekEncryption, "no key"), true);
         setup(state, 0L, TimeValue.timeValueDays(30));
 
         coordinator.onClusterStateChanged(new ClusterChangedEvent("test", state, state));
         coordinator.onClusterStateChanged(new ClusterChangedEvent("test", state, state));
-        assertEquals(1, fetches.get());
         ArgumentCaptor<KeyRotationCoordinator.KeyRotationTask> restore = ArgumentCaptor.forClass(
             KeyRotationCoordinator.KeyRotationTask.class
         );
@@ -323,27 +301,27 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
 
         settingsRef.set(settingsWithActivePassword());
         coordinator.reload();
-        assertEquals("a reload retries", 2, fetches.get());
+        verify(taskQueue, times(2)).submitTask(eq("restore-project-encryption-keys"), any(), any());
     }
 
-    /** A node that holds the key may not have answered, so a fetch with node failures is retried. */
-    public void testFetchIsRetriedWhenANodeDidNotAnswer() {
+    public void testElectedMasterWithoutACopyOnDiskWarns() {
         ClusterState state = clusterStateWith(ProjectEncryptionKeyMetadata.degraded("k1", PASSWORD_ID, NO_OP_ENCRYPTION, "no key"), true);
         setup(state, 0L, TimeValue.timeValueDays(30));
-        failFetchFrom = "other";
 
-        coordinator.onClusterStateChanged(new ClusterChangedEvent("test", state, state));
-        ArgumentCaptor<Runnable> retry = ArgumentCaptor.forClass(Runnable.class);
-        verify(threadPool).schedule(retry.capture(), eq(KeyRotationCoordinator.INSTALL_RETRY_INTERVAL), any());
-
-        failFetchFrom = null;
-        keysOnDisk = node -> new ProjectEncryptionKeyMetadata(Map.of("k1", entry(1L)), "k1", PASSWORD_ID, Map.of(), NO_OP_ENCRYPTION);
-        retry.getValue().run();
-        assertEquals(2, fetches.get());
-        verify(taskQueue).submitTask(eq("restore-project-encryption-keys"), isA(KeyRotationCoordinator.RestoreKeysTask.class), any());
+        MockLog.assertThatLogger(
+            () -> coordinator.onClusterStateChanged(new ClusterChangedEvent("test", state, state)),
+            KeyRotationCoordinator.class,
+            new MockLog.SeenEventExpectation(
+                "tells the operator how to recover",
+                KeyRotationCoordinator.class.getName(),
+                Level.WARN,
+                "the elected master holds no project encryption key [k1] and cannot read it from its disk*"
+            )
+        );
+        verify(taskQueue, never()).submitTask(anyString(), any(), any());
     }
 
-    public void testElectedMasterThatCannotPersistTheKeyDoesNotFetchIt() {
+    public void testElectedMasterThatCannotPersistTheKeyDoesNotRestoreIt() {
         ClusterState state = clusterStateWith(ProjectEncryptionKeyMetadata.degraded("k1", PASSWORD_ID, NO_OP_ENCRYPTION, "no key"), true);
         setup(state, 0L, TimeValue.timeValueDays(30), TimeValue.timeValueMinutes(1), mock(FeatureService.class), List.of(), Settings.EMPTY);
 
@@ -357,7 +335,7 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
                 "the elected master holds no project encryption key [k1] and cannot persist it*"
             )
         );
-        assertEquals(0, fetches.get());
+        verify(taskQueue, never()).submitTask(anyString(), any(), any());
     }
 
     public void testInstallNotSubmittedWhenActivePasswordMissing() {
@@ -914,7 +892,7 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
     }
 
     private static SimpleBatchedExecutor<KeyRotationCoordinator.KeyRotationTask, Void> newExecutor(long now) {
-        return new KeyRotationCoordinator.KeyRotationExecutor(DefaultProjectResolver.INSTANCE, NO_OP_ENCRYPTION);
+        return new KeyRotationCoordinator.KeyRotationExecutor(DefaultProjectResolver.INSTANCE, NO_OP_ENCRYPTION, false);
     }
 
     private static ActionListener<Void> listenerCapturingResponses(AtomicInteger counter) {

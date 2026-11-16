@@ -31,7 +31,8 @@ public class KeyRotationExecutorTests extends ESTestCase {
     private static final ProjectEncryptionKeyMetadata.PekEncryption NO_OP_ENCRYPTION = TestPekEncryption.NO_OP;
     private final KeyRotationCoordinator.KeyRotationExecutor executor = new KeyRotationCoordinator.KeyRotationExecutor(
         DefaultProjectResolver.INSTANCE,
-        NO_OP_ENCRYPTION
+        NO_OP_ENCRYPTION,
+        false
     );
 
     private static byte[] randomKey() {

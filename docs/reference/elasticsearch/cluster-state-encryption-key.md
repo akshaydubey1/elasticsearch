@@ -120,12 +120,12 @@ The `cluster_state_encryption` health indicator reports on the status of the clu
 
 ### If the elected master holds no key [cluster-state-encryption-master-without-key]
 
-A node that can't decrypt the key on its disk, for example because it restarted without its password, still starts. If it's elected master, encryption is unavailable on every node until it has the key again. The other nodes keep their copies of the key on disk, and the elected master gets the key from any of them automatically, as long as it has an encryption password itself:
+A node that can't decrypt the key on its disk, for example because it restarted without its password, still starts. If it's elected master, encryption is unavailable on every node until it has the key again. Every node keeps its copy of the key on disk in the meantime. To recover:
 
-* If the elected master has no password configured, configure `cluster.state.encryption.active_password_id` and the matching `cluster.state.encryption.password.<id>` on it, then reload its secure settings.
-* If the nodes that hold the key aren't in the cluster, start them. The elected master asks again whenever a node joins.
+* Configure the password that the elected master's copy is wrapped with on the elected master, as `cluster.state.encryption.password.<id>` together with `cluster.state.encryption.active_password_id`, then reload its secure settings. The elected master then reads the key from its disk.
+* If that password is lost, restart the master-eligible nodes so that a node that can read its copy is elected.
 
-The elected master logs a warning that says which of these applies. Don't reset the key while another node might still hold it: a reset permanently deletes all encrypted data. To check, send `GET /_health_report/cluster_state_encryption` directly to each node. A node that reports `key_on_disk: true` holds a copy of the key, and `can_read_key_on_disk: true` means it has the password to read that copy.
+The elected master logs a warning that says why it can't read its copy. Don't reset the key while another node might still hold it: a reset permanently deletes all encrypted data. To check, send `GET /_health_report/cluster_state_encryption` directly to each node. A node that reports `key_on_disk: true` holds a copy of the key, and `can_read_key_on_disk: true` means it has the password to read that copy.
 
 ## Reset the cluster state encryption key [cluster-state-encryption-key-reset]
 

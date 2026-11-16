@@ -58,7 +58,7 @@ import static org.elasticsearch.xcontent.ConstructingObjectParser.constructorArg
  * <p>If a node cannot unwrap the on-disk blob at startup (missing or wrong password), {@link #fromXContent} produces a <em>degraded</em>
  * instance ({@link #isUnwrapFailed()} returns {@code true}) instead of throwing, so the node still starts. A follower gets the key from
  * the elected master's next publication. If the node is elected master, it publishes the degraded instance, and encrypt/decrypt calls
- * fail on every node until it gets the key from another node (see {@link KeyRotationCoordinator}) or
+ * fail on every node until it reads the key from its own disk (see {@link KeyRotationCoordinator}) or
  * {@code POST /_encryption/_reset?accept_data_loss=true} is called.
  */
 class ProjectEncryptionKeyMetadata extends AbstractNamedDiffable<Metadata.ProjectCustom> implements Metadata.ProjectCustom {
