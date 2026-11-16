@@ -21,8 +21,11 @@ import org.elasticsearch.health.SimpleHealthIndicatorDetails;
 import org.elasticsearch.health.node.HealthInfo;
 import org.elasticsearch.xpack.encryption.spi.EncryptionServiceState;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 
 import static org.elasticsearch.health.HealthStatus.GREEN;
 import static org.elasticsearch.health.HealthStatus.RED;
@@ -121,17 +124,26 @@ class ProjectEncryptionKeyHealthIndicatorService implements HealthIndicatorServi
     private final ClusterService clusterService;
     private final ProjectResolver projectResolver;
     private final ProjectEncryptionKeyService pekService;
+    private final BooleanSupplier canWrapForDisk;
+    private final Supplier<Boolean> keyOnDisk;
+    private final BooleanSupplier canReadKeyOnDisk;
     private final EncryptedDataHandlerRegistry handlerRegistry;
 
     ProjectEncryptionKeyHealthIndicatorService(
         ClusterService clusterService,
         ProjectResolver projectResolver,
         ProjectEncryptionKeyService pekService,
+        BooleanSupplier canWrapForDisk,
+        Supplier<Boolean> keyOnDisk,
+        BooleanSupplier canReadKeyOnDisk,
         EncryptedDataHandlerRegistry handlerRegistry
     ) {
         this.clusterService = clusterService;
         this.projectResolver = projectResolver;
         this.pekService = pekService;
+        this.canWrapForDisk = canWrapForDisk;
+        this.keyOnDisk = keyOnDisk;
+        this.canReadKeyOnDisk = canReadKeyOnDisk;
         this.handlerRegistry = handlerRegistry;
     }
 
@@ -158,7 +170,7 @@ class ProjectEncryptionKeyHealthIndicatorService implements HealthIndicatorServi
                         List.of()
                     );
                 }
-                if (pekService.canWrapForDisk() == false) {
+                if (canWrapForDisk.getAsBoolean() == false) {
                     yield createIndicator(
                         YELLOW,
                         YELLOW_CANNOT_PERSIST,
@@ -204,33 +216,22 @@ class ProjectEncryptionKeyHealthIndicatorService implements HealthIndicatorServi
 
     private HealthIndicatorDetails detailsBuilder(@Nullable ProjectEncryptionKeyMetadata metadata, EncryptionServiceState serviceState) {
         String activePasswordId = pekService.getActivePasswordId();
-        if (metadata == null) {
-            return new SimpleHealthIndicatorDetails(
-                Map.of(
-                    "state",
-                    serviceState.displayValue(),
-                    "encryption_required",
-                    pekService.isEncryptionRequired(),
-                    "active_password_id",
-                    activePasswordId == null ? "(unset)" : activePasswordId
-                )
-            );
+        Map<String, Object> details = new HashMap<>();
+        details.put("state", serviceState.displayValue());
+        details.put("encryption_required", pekService.isEncryptionRequired());
+        details.put("active_password_id", activePasswordId == null ? "(unset)" : activePasswordId);
+        Boolean holdsKeyOnDisk = keyOnDisk.get();
+        if (holdsKeyOnDisk != null) {
+            details.put("key_on_disk", holdsKeyOnDisk);
+            if (holdsKeyOnDisk) {
+                details.put("can_read_key_on_disk", canReadKeyOnDisk.getAsBoolean());
+            }
         }
-        return new SimpleHealthIndicatorDetails(
-            Map.of(
-                "state",
-                serviceState.displayValue(),
-                "encryption_required",
-                pekService.isEncryptionRequired(),
-                "active_password_id",
-                activePasswordId == null ? "(unset)" : activePasswordId,
-                "metadata_password_id",
-                metadata.getPasswordId(),
-                "active_key_id",
-                metadata.getActiveKeyId(),
-                "key_count",
-                metadata.getKeys().size()
-            )
-        );
+        if (metadata != null) {
+            details.put("metadata_password_id", metadata.getPasswordId());
+            details.put("active_key_id", metadata.getActiveKeyId());
+            details.put("key_count", metadata.getKeys().size());
+        }
+        return new SimpleHealthIndicatorDetails(details);
     }
 }

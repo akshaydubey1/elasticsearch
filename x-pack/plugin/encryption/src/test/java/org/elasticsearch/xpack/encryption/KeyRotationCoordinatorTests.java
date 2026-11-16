@@ -40,6 +40,8 @@ import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.test.MockLog;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.xcontent.ToXContent;
+import org.elasticsearch.xcontent.XContentBuilder;
+import org.elasticsearch.xcontent.json.JsonXContent;
 import org.elasticsearch.xpack.encryption.ProjectEncryptionKeyMetadata.KeyEntry;
 import org.elasticsearch.xpack.encryption.spi.EncryptedData;
 import org.elasticsearch.xpack.encryption.spi.EncryptedDataHandler;
@@ -77,6 +79,8 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
     private static final String PASSWORD_VALUE = "test-password-fips";
 
     private static final ProjectEncryptionKeyMetadata.PekEncryption NO_OP_ENCRYPTION = TestPekEncryption.NO_OP;
+
+    private ProjectEncryptionKeyMetadata.PekEncryption pekEncryption = NO_OP_ENCRYPTION;
 
     private static byte[] randomKey() {
         byte[] keyBytes = new byte[PasswordBasedEncryption.PEK_LENGTH_BYTES];
@@ -202,7 +206,7 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
             encryptionService,
             handlers,
             settingsRef::get,
-            NO_OP_ENCRYPTION,
+            pekEncryption,
             stubClient()
         );
     }
@@ -232,6 +236,25 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
 
     private void setup(ClusterState state, long now, TimeValue rotationInterval) {
         setup(state, now, rotationInterval, TimeValue.timeValueMinutes(1));
+    }
+
+    /** A reset removes the key on every node, so this node no longer reports a copy of it on disk. */
+    public void testResetForgetsThisNodesCopyOfTheKey() throws IOException {
+        ProjectEncryptionKeyMetadata.GatewayKeys keys = new ProjectEncryptionKeyMetadata.GatewayKeys();
+        pekEncryption = TestPekEncryption.onNode(NO_OP_ENCRYPTION, keys);
+        ProjectEncryptionKeyMetadata existing = new ProjectEncryptionKeyMetadata(Map.of("k1", entry(0L)), "k1", PASSWORD_ID, Map.of(), pekEncryption);
+        ToXContent.Params gateway = new ToXContent.MapParams(Map.of(Metadata.CONTEXT_MODE_PARAM, Metadata.CONTEXT_MODE_GATEWAY));
+        try (XContentBuilder builder = JsonXContent.contentBuilder().startObject()) {
+            for (Iterator<? extends ToXContent> it = existing.toXContentChunked(gateway); it.hasNext();) {
+                it.next().toXContent(builder, gateway);
+            }
+        }
+        assertEquals(Boolean.TRUE, keys.holdsKeys());
+        setup(clusterStateWith(existing, false), 0L, TimeValue.timeValueDays(30));
+
+        coordinator.onClusterStateChanged(new ClusterChangedEvent("test", clusterStateWith(null, false), clusterStateWith(existing, false)));
+
+        assertNull(keys.holdsKeys());
     }
 
     public void testInstallSubmittedWhenMasterWithoutKeyAndFeatureAvailable() {

@@ -118,6 +118,9 @@ public class EncryptionPlugin extends Plugin
             services.clusterService(),
             services.projectResolver(),
             pekService,
+            pekEncryption::canWrapForDisk,
+            pekEncryption::keyOnDisk,
+            pekEncryption::canReadKeyOnDisk,
             handlerRegistry
         );
 
@@ -149,14 +152,12 @@ public class EncryptionPlugin extends Plugin
     @Override
     public synchronized void reload(Settings settings) {
         Settings updated = ProjectEncryptionKeyPasswordSettings.cloneSettings(settings);
-        if (persistsClusterState
-            && clusterUsesKey()
-            && ProjectEncryptionKeyPasswordSettings.canWrapForDisk(pekSettings)
-            && ProjectEncryptionKeyPasswordSettings.canWrapForDisk(updated) == false) {
-            throw new IllegalArgumentException(
-                "cannot reload cluster state encryption settings: the cluster uses a cluster state encryption key, and without ["
-                    + ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY
-                    + "] and its password this node could no longer persist cluster state; keeping the previous settings"
+        if (persistsClusterState && clusterUsesKey()) {
+            ProjectEncryptionKeyPasswordSettings.validateReload(
+                pekEncryption.canWrapForDisk(),
+                pekSettings,
+                updated,
+                pekEncryption.keyOnDiskPasswordId()
             );
         }
         this.pekSettings = updated;
@@ -190,12 +191,12 @@ public class EncryptionPlugin extends Plugin
                 return;
             }
             ProjectEncryptionKeyMetadata metadata = service.metadataIn(state);
-            if (metadata != null
-                && metadata.isUnwrapFailed() == false
-                && ProjectEncryptionKeyPasswordSettings.canWrapForDisk(pekSettings) == false) {
+            String wrapFailure = metadata == null || metadata.isUnwrapFailed() ? null : pekEncryption.wrapForDiskFailure();
+            if (wrapFailure != null) {
                 throw new IllegalStateException(
-                    "this node cannot join the cluster: the cluster uses a cluster state encryption key and this node cannot persist it."
-                        + " Configure ["
+                    "this node cannot join the cluster: the cluster uses a cluster state encryption key and this node cannot persist it ("
+                        + wrapFailure
+                        + "). Configure ["
                         + ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY
                         + "] and the matching ["
                         + ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX

@@ -26,6 +26,10 @@ public final class PasswordPekEncryption implements ProjectEncryptionKeyMetadata
     private final Supplier<Settings> settingsSupplier;
     private final ProjectEncryptionKeyMetadata.GatewayKeys gatewayKeys = new ProjectEncryptionKeyMetadata.GatewayKeys();
 
+    private record WrapCheck(Settings settings, @Nullable String failure) {}
+
+    private volatile WrapCheck wrapCheck;
+
     PasswordPekEncryption(Supplier<Settings> settingsSupplier) {
         this.settingsSupplier = settingsSupplier;
     }
@@ -37,7 +41,36 @@ public final class PasswordPekEncryption implements ProjectEncryptionKeyMetadata
 
     /** Returns whether this node can write the key to its disk. */
     boolean canWrapForDisk() {
-        return ProjectEncryptionKeyPasswordSettings.canWrapForDisk(settingsSupplier.get());
+        return wrapForDiskFailure() == null;
+    }
+
+    /** Returns why this node cannot write the key to its disk, or {@code null} if it can. Cached per secure settings snapshot. */
+    @Nullable
+    String wrapForDiskFailure() {
+        Settings settings = settingsSupplier.get();
+        WrapCheck check = wrapCheck;
+        if (check == null || check.settings() != settings) {
+            check = new WrapCheck(settings, ProjectEncryptionKeyPasswordSettings.wrapForDiskFailure(settings));
+            wrapCheck = check;
+        }
+        return check.failure();
+    }
+
+    /** Returns whether this node holds a copy of the key on disk, or {@code null} if it has not read or persisted one yet. */
+    @Nullable
+    Boolean keyOnDisk() {
+        return gatewayKeys.holdsKeys();
+    }
+
+    /** Returns whether this node has the password its on-disk copy of the key is wrapped with, so it can read the copy. */
+    boolean canReadKeyOnDisk() {
+        String passwordId = gatewayKeys.passwordId();
+        return passwordId != null && ProjectEncryptionKeyPasswordSettings.hasPassword(settingsSupplier.get(), passwordId);
+    }
+
+    @Nullable
+    String keyOnDiskPasswordId() {
+        return gatewayKeys.passwordId();
     }
 
     /**

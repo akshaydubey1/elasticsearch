@@ -164,9 +164,31 @@ class ProjectEncryptionKeyMetadata extends AbstractNamedDiffable<Metadata.Projec
     @FixForMultiProject(description = "one copy per node; with multiple projects each project's copy overwrites the others")
     static final class GatewayKeys {
         private GatewayCopy copy;
+        private boolean known;
 
         synchronized void set(@Nullable GatewayCopy copy) {
             this.copy = copy;
+            this.known = true;
+        }
+
+        /** Forgets this node's copy if it is for {@code activeKeyId}, a key that a reset removed. */
+        synchronized void clearIfActiveKey(String activeKeyId) {
+            if (copy == null || copy.activeKeyId().equals(activeKeyId)) {
+                copy = null;
+                known = false;
+            }
+        }
+
+        /** Returns whether this node holds a copy, or {@code null} if it has not read or persisted one since startup or a reset. */
+        @Nullable
+        synchronized Boolean holdsKeys() {
+            return known ? copy != null : null;
+        }
+
+        /** Returns the id of the password this node's copy is wrapped with, or {@code null} if it holds none. */
+        @Nullable
+        synchronized String passwordId() {
+            return copy == null ? null : copy.passwordId();
         }
 
         /** Returns this node's copy if it is for {@code activeKeyId}, otherwise {@code null}. */

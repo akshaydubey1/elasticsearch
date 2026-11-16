@@ -63,24 +63,14 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
     }
 
     private static ProjectEncryptionKeyService mockPekService(EncryptionServiceState state, String activePasswordId) {
-        return mockPekService(state, activePasswordId, true, true);
+        return mockPekService(state, activePasswordId, true);
     }
 
     private static ProjectEncryptionKeyService mockPekService(EncryptionServiceState state, String activePasswordId, boolean required) {
-        return mockPekService(state, activePasswordId, required, true);
-    }
-
-    private static ProjectEncryptionKeyService mockPekService(
-        EncryptionServiceState state,
-        String activePasswordId,
-        boolean required,
-        boolean canWrapForDisk
-    ) {
         ProjectEncryptionKeyService svc = mock(ProjectEncryptionKeyService.class);
         when(svc.state()).thenReturn(state);
         when(svc.getActivePasswordId()).thenReturn(activePasswordId);
         when(svc.isEncryptionRequired()).thenReturn(required);
-        when(svc.canWrapForDisk()).thenReturn(canWrapForDisk);
         return svc;
     }
 
@@ -91,6 +81,9 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
             mockClusterService(state),
             DefaultProjectResolver.INSTANCE,
             mockPekService(EncryptionServiceState.DISABLED, null),
+            () -> true,
+            () -> null,
+            () -> false,
             new EncryptedDataHandlerRegistry(List.of())
         );
 
@@ -107,6 +100,9 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
             mockClusterService(state),
             DefaultProjectResolver.INSTANCE,
             mockPekService(EncryptionServiceState.READY, PASSWORD_ID),
+            () -> true,
+            () -> null,
+            () -> false,
             new EncryptedDataHandlerRegistry(List.of())
         );
 
@@ -122,6 +118,9 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
             mockClusterService(state),
             DefaultProjectResolver.INSTANCE,
             mockPekService(EncryptionServiceState.READY, PASSWORD_ID),
+            () -> true,
+            () -> null,
+            () -> false,
             new EncryptedDataHandlerRegistry(List.of())
         );
 
@@ -138,6 +137,9 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
             mockClusterService(state),
             DefaultProjectResolver.INSTANCE,
             mockPekService(EncryptionServiceState.DISABLED, null, false),
+            () -> true,
+            () -> null,
+            () -> false,
             new EncryptedDataHandlerRegistry(List.of())
         );
 
@@ -156,6 +158,9 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
             mockClusterService(state),
             DefaultProjectResolver.INSTANCE,
             mockPekService(EncryptionServiceState.DISABLED, null, true),
+            () -> true,
+            () -> null,
+            () -> false,
             new EncryptedDataHandlerRegistry(List.of())
         );
 
@@ -171,7 +176,10 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
         ProjectEncryptionKeyHealthIndicatorService indicator = new ProjectEncryptionKeyHealthIndicatorService(
             mockClusterService(state),
             DefaultProjectResolver.INSTANCE,
-            mockPekService(EncryptionServiceState.READY, null, true, false),
+            mockPekService(EncryptionServiceState.READY, null),
+            () -> false,
+            () -> null,
+            () -> false,
             new EncryptedDataHandlerRegistry(List.of())
         );
 
@@ -212,6 +220,9 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
             mockClusterService(state),
             DefaultProjectResolver.INSTANCE,
             mockPekService(EncryptionServiceState.UNAVAILABLE_DECRYPTION_FAILED, PASSWORD_ID),
+            () -> true,
+            () -> null,
+            () -> false,
             new EncryptedDataHandlerRegistry(List.of(handler))
         );
 
@@ -230,6 +241,9 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
             mockClusterService(state),
             DefaultProjectResolver.INSTANCE,
             mockPekService(EncryptionServiceState.UNAVAILABLE_MISSING_PASSWORD, null),
+            () -> true,
+            () -> null,
+            () -> false,
             new EncryptedDataHandlerRegistry(List.of())
         );
 
@@ -249,11 +263,32 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
             mockClusterService(state),
             DefaultProjectResolver.INSTANCE,
             mockPekService(EncryptionServiceState.READY, PASSWORD_ID),
+            () -> true,
+            () -> null,
+            () -> false,
             new EncryptedDataHandlerRegistry(List.of())
         );
 
         HealthIndicatorResult result = indicator.calculate(true, 1, HealthInfo.EMPTY_HEALTH_INFO);
         assertEquals(EncryptionServiceState.READY.displayValue(), detailsMap(result).get("state"));
+    }
+
+    public void testKeyOnDiskDetails() {
+        Boolean keyOnDisk = randomFrom(true, false, null);
+        boolean canRead = randomBoolean();
+        ProjectEncryptionKeyHealthIndicatorService indicator = new ProjectEncryptionKeyHealthIndicatorService(
+            mockClusterService(stateWith(pekMetadata(PASSWORD_ID))),
+            DefaultProjectResolver.INSTANCE,
+            mockPekService(EncryptionServiceState.READY, PASSWORD_ID),
+            () -> true,
+            () -> keyOnDisk,
+            () -> canRead,
+            new EncryptedDataHandlerRegistry(List.of())
+        );
+
+        Map<String, Object> details = detailsMap(indicator.calculate(true, 1, HealthInfo.EMPTY_HEALTH_INFO));
+        assertEquals(keyOnDisk, details.get("key_on_disk"));
+        assertEquals(Boolean.TRUE.equals(keyOnDisk) ? canRead : null, details.get("can_read_key_on_disk"));
     }
 
     private static Map<String, Object> detailsMap(HealthIndicatorResult result) {

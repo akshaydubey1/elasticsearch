@@ -274,6 +274,13 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
         if (state.blocks().hasGlobalBlock(GatewayService.STATE_NOT_RECOVERED_BLOCK)) {
             return;
         }
+        ProjectEncryptionKeyMetadata.GatewayKeys gatewayKeys = pekEncryption.gatewayKeys();
+        if (gatewayKeys != null && event.previousState().blocks().hasGlobalBlock(GatewayService.STATE_NOT_RECOVERED_BLOCK) == false) {
+            ProjectEncryptionKeyMetadata previous = getCurrentMetadata(event.previousState());
+            if (previous != null && getCurrentMetadata(state) == null) {
+                gatewayKeys.clearIfActiveKey(previous.getActiveKeyId());
+            }
+        }
         if (event.localNodeMaster() == false) {
             return;
         }
@@ -603,7 +610,7 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
             return;
         }
         String activeKeyId = degraded.getActiveKeyId();
-        if (ProjectEncryptionKeyPasswordSettings.canWrapForDisk(settings) == false) {
+        if (ProjectEncryptionKeyPasswordSettings.hasActivePassword(settings) == false) {
             logger.warn(
                 "the elected master holds no project encryption key [{}] and cannot persist it, so cluster state encryption is unavailable."
                     + " Configure [{}] and the matching [{}<id>] secure setting on this node and reload secure settings; it then gets"

@@ -492,6 +492,25 @@ public class ProjectEncryptionKeyMetadataTests extends ChunkedToXContentDiffable
         assertNull("no copy of another active key", ProjectEncryptionKeyMetadata.unwrapGatewayKeys("k1", peer));
     }
 
+    public void testGatewayKeysTrackTheCopyOnDiskUntilAReset() throws IOException {
+        GatewayKeys keys = new GatewayKeys();
+        PekEncryption node = TestPekEncryption.onNode(NO_OP_ENCRYPTION, keys);
+        assertNull("nothing read or written yet", keys.holdsKeys());
+
+        chunkedToXContent(
+            new ProjectEncryptionKeyMetadata(Map.of("k1", new KeyEntry(randomPlaintextBytes(), 10L)), "k1", PASSWORD_ID, Map.of(), node),
+            getToXContentParams()
+        );
+        assertEquals(Boolean.TRUE, keys.holdsKeys());
+        assertEquals(PASSWORD_ID, keys.passwordId());
+
+        keys.clearIfActiveKey("other");
+        assertEquals("a reset of another key leaves this copy", Boolean.TRUE, keys.holdsKeys());
+        keys.clearIfActiveKey("k1");
+        assertNull(keys.holdsKeys());
+        assertNull(keys.passwordId());
+    }
+
     /** Writing a copy for a different active key would roll the key set back if this node were later elected master. */
     public void testPeerDropsItsCopyWhenDegradedMasterHasDifferentActiveKey() throws IOException {
         PekEncryption peer = TestPekEncryption.onNode(NO_OP_ENCRYPTION, new GatewayKeys());
