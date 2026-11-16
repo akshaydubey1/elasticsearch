@@ -56,30 +56,10 @@ public final class PasswordPekEncryption implements ProjectEncryptionKeyMetadata
         return check.failure();
     }
 
-    /** Returns whether this node holds a copy of the key on disk, or {@code null} if it has not read or persisted one yet. */
-    @Nullable
-    Boolean keyOnDisk() {
-        return gatewayKeys.holdsKeys();
-    }
-
     /** Returns whether this node has the password its on-disk copy of the key is wrapped with, so it can read the copy. */
     boolean canReadKeyOnDisk() {
         String passwordId = gatewayKeys.passwordId();
         return passwordId != null && ProjectEncryptionKeyPasswordSettings.hasPassword(settingsSupplier.get(), passwordId);
-    }
-
-    @Nullable
-    String keyOnDiskPasswordId() {
-        return gatewayKeys.passwordId();
-    }
-
-    /**
-     * Returns the keys for {@code activeKeyId} from this node's disk, unwrapped with its password, or {@code null} if it holds no copy of
-     * that key. Throws if it holds a copy but cannot unwrap it.
-     */
-    @Nullable
-    ProjectEncryptionKeyMetadata gatewayKeysFor(String activeKeyId) {
-        return ProjectEncryptionKeyMetadata.unwrapGatewayKeys(activeKeyId, this);
     }
 
     @Override

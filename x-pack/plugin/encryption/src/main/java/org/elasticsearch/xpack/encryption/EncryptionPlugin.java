@@ -64,7 +64,6 @@ public class EncryptionPlugin extends Plugin
     private final SetOnce<ProjectEncryptionKeyService> pekService = new SetOnce<>();
     private final SetOnce<ClusterService> clusterService = new SetOnce<>();
 
-    // whether this node writes cluster state to its own disk, and so must be able to persist the key; never in serverless
     private final boolean persistsClusterState;
     private volatile Settings pekSettings;
 
@@ -119,7 +118,7 @@ public class EncryptionPlugin extends Plugin
             services.projectResolver(),
             pekService,
             pekEncryption::canWrapForDisk,
-            pekEncryption::keyOnDisk,
+            pekEncryption.gatewayKeys()::holdsKeys,
             pekEncryption::canReadKeyOnDisk,
             handlerRegistry
         );
@@ -157,7 +156,7 @@ public class EncryptionPlugin extends Plugin
                 pekEncryption.canWrapForDisk(),
                 pekSettings,
                 updated,
-                pekEncryption.keyOnDiskPasswordId()
+                pekEncryption.gatewayKeys().passwordId()
             );
         }
         this.pekSettings = updated;

@@ -124,7 +124,9 @@ final class ProjectEncryptionKeyPasswordSettings {
                 );
             }
         }
-        if (keyOnDiskPasswordId != null && hasPassword(current, keyOnDiskPasswordId) && hasPassword(updated, keyOnDiskPasswordId) == false) {
+        if (keyOnDiskPasswordId != null
+            && hasPassword(current, keyOnDiskPasswordId)
+            && hasPassword(updated, keyOnDiskPasswordId) == false) {
             String missing = PASSWORD_PREFIX + keyOnDiskPasswordId;
             throw new IllegalArgumentException(
                 "cannot reload cluster state encryption settings: this node's on-disk copy of the cluster state encryption key is wrapped"

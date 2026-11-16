@@ -74,18 +74,22 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
         return svc;
     }
 
-    public void testGreenWhenNoMetadataAndNoSettings() {
-        ClusterState state = stateWith(null);
-
-        ProjectEncryptionKeyHealthIndicatorService indicator = new ProjectEncryptionKeyHealthIndicatorService(
+    private static ProjectEncryptionKeyHealthIndicatorService indicator(ClusterState state, ProjectEncryptionKeyService pekService) {
+        return new ProjectEncryptionKeyHealthIndicatorService(
             mockClusterService(state),
             DefaultProjectResolver.INSTANCE,
-            mockPekService(EncryptionServiceState.DISABLED, null),
+            pekService,
             () -> true,
             () -> null,
             () -> false,
             new EncryptedDataHandlerRegistry(List.of())
         );
+    }
+
+    public void testGreenWhenNoMetadataAndNoSettings() {
+        ClusterState state = stateWith(null);
+
+        ProjectEncryptionKeyHealthIndicatorService indicator = indicator(state, mockPekService(EncryptionServiceState.DISABLED, null));
 
         HealthIndicatorResult result = indicator.calculate(false, 1, HealthInfo.EMPTY_HEALTH_INFO);
         assertEquals(HealthStatus.GREEN, result.status());
@@ -96,15 +100,7 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
         ProjectEncryptionKeyMetadata metadata = pekMetadata(PASSWORD_ID);
         ClusterState state = stateWith(metadata);
 
-        ProjectEncryptionKeyHealthIndicatorService indicator = new ProjectEncryptionKeyHealthIndicatorService(
-            mockClusterService(state),
-            DefaultProjectResolver.INSTANCE,
-            mockPekService(EncryptionServiceState.READY, PASSWORD_ID),
-            () -> true,
-            () -> null,
-            () -> false,
-            new EncryptedDataHandlerRegistry(List.of())
-        );
+        ProjectEncryptionKeyHealthIndicatorService indicator = indicator(state, mockPekService(EncryptionServiceState.READY, PASSWORD_ID));
 
         HealthIndicatorResult result = indicator.calculate(false, 1, HealthInfo.EMPTY_HEALTH_INFO);
         assertEquals(HealthStatus.GREEN, result.status());
@@ -114,15 +110,7 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
     public void testGreenWhenSettingsConfiguredButMetadataNotYetInstalled() {
         ClusterState state = stateWith(null);
 
-        ProjectEncryptionKeyHealthIndicatorService indicator = new ProjectEncryptionKeyHealthIndicatorService(
-            mockClusterService(state),
-            DefaultProjectResolver.INSTANCE,
-            mockPekService(EncryptionServiceState.READY, PASSWORD_ID),
-            () -> true,
-            () -> null,
-            () -> false,
-            new EncryptedDataHandlerRegistry(List.of())
-        );
+        ProjectEncryptionKeyHealthIndicatorService indicator = indicator(state, mockPekService(EncryptionServiceState.READY, PASSWORD_ID));
 
         HealthIndicatorResult result = indicator.calculate(false, 1, HealthInfo.EMPTY_HEALTH_INFO);
         assertEquals(HealthStatus.GREEN, result.status());
@@ -133,14 +121,9 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
     public void testYellowWhenDisabledAndEncryptionNotRequired() {
         ClusterState state = stateWith(null);
 
-        ProjectEncryptionKeyHealthIndicatorService indicator = new ProjectEncryptionKeyHealthIndicatorService(
-            mockClusterService(state),
-            DefaultProjectResolver.INSTANCE,
-            mockPekService(EncryptionServiceState.DISABLED, null, false),
-            () -> true,
-            () -> null,
-            () -> false,
-            new EncryptedDataHandlerRegistry(List.of())
+        ProjectEncryptionKeyHealthIndicatorService indicator = indicator(
+            state,
+            mockPekService(EncryptionServiceState.DISABLED, null, false)
         );
 
         HealthIndicatorResult result = indicator.calculate(true, 1, HealthInfo.EMPTY_HEALTH_INFO);
@@ -154,14 +137,9 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
     public void testGreenWhenDisabledAndEncryptionRequired() {
         ClusterState state = stateWith(null);
 
-        ProjectEncryptionKeyHealthIndicatorService indicator = new ProjectEncryptionKeyHealthIndicatorService(
-            mockClusterService(state),
-            DefaultProjectResolver.INSTANCE,
-            mockPekService(EncryptionServiceState.DISABLED, null, true),
-            () -> true,
-            () -> null,
-            () -> false,
-            new EncryptedDataHandlerRegistry(List.of())
+        ProjectEncryptionKeyHealthIndicatorService indicator = indicator(
+            state,
+            mockPekService(EncryptionServiceState.DISABLED, null, true)
         );
 
         HealthIndicatorResult result = indicator.calculate(false, 1, HealthInfo.EMPTY_HEALTH_INFO);
@@ -237,14 +215,9 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
     public void testYellowWhenMissingPassword() {
         ClusterState state = stateWith(null);
 
-        ProjectEncryptionKeyHealthIndicatorService indicator = new ProjectEncryptionKeyHealthIndicatorService(
-            mockClusterService(state),
-            DefaultProjectResolver.INSTANCE,
-            mockPekService(EncryptionServiceState.UNAVAILABLE_MISSING_PASSWORD, null),
-            () -> true,
-            () -> null,
-            () -> false,
-            new EncryptedDataHandlerRegistry(List.of())
+        ProjectEncryptionKeyHealthIndicatorService indicator = indicator(
+            state,
+            mockPekService(EncryptionServiceState.UNAVAILABLE_MISSING_PASSWORD, null)
         );
 
         HealthIndicatorResult result = indicator.calculate(true, 1, HealthInfo.EMPTY_HEALTH_INFO);
@@ -259,15 +232,7 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
         ProjectEncryptionKeyMetadata metadata = pekMetadata(PASSWORD_ID);
         ClusterState state = stateWith(metadata);
 
-        ProjectEncryptionKeyHealthIndicatorService indicator = new ProjectEncryptionKeyHealthIndicatorService(
-            mockClusterService(state),
-            DefaultProjectResolver.INSTANCE,
-            mockPekService(EncryptionServiceState.READY, PASSWORD_ID),
-            () -> true,
-            () -> null,
-            () -> false,
-            new EncryptedDataHandlerRegistry(List.of())
-        );
+        ProjectEncryptionKeyHealthIndicatorService indicator = indicator(state, mockPekService(EncryptionServiceState.READY, PASSWORD_ID));
 
         HealthIndicatorResult result = indicator.calculate(true, 1, HealthInfo.EMPTY_HEALTH_INFO);
         assertEquals(EncryptionServiceState.READY.displayValue(), detailsMap(result).get("state"));

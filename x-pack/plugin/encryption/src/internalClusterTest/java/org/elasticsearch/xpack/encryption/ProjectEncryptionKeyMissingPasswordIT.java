@@ -190,10 +190,6 @@ public class ProjectEncryptionKeyMissingPasswordIT extends ESIntegTestCase {
         }
     }
 
-    private static String otherNode(String node) {
-        return randomValueOtherThan(node, () -> randomFrom(internalCluster().getNodeNames()));
-    }
-
     private static void clearVotingConfigExclusions() throws Exception {
         ClearVotingConfigExclusionsRequest request = new ClearVotingConfigExclusionsRequest(TEST_REQUEST_TIMEOUT);
         request.setWaitForRemoval(false);

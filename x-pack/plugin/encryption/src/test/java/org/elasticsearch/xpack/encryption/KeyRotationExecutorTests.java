@@ -287,14 +287,7 @@ public class KeyRotationExecutorTests extends ESTestCase {
         ClusterState restored = executor.executeTask(new KeyRotationCoordinator.RestoreKeysTask(keys), stateWith(degraded("k1"))).v1();
         assertSame(keys, metadataOf(restored));
 
-        ProjectEncryptionKeyMetadata usable = new ProjectEncryptionKeyMetadata(
-            Map.of("k1", entry(1L)),
-            "k1",
-            PASSWORD_ID,
-            Map.of(),
-            NO_OP_ENCRYPTION
-        );
-        for (ClusterState state : List.of(stateWith(degraded("k2")), stateWith(null), stateWith(usable))) {
+        for (ClusterState state : List.of(stateWith(degraded("k2")), stateWith(null), stateWith(keys))) {
             assertSame(state, executor.executeTask(new KeyRotationCoordinator.RestoreKeysTask(keys), state).v1());
         }
     }

@@ -37,7 +37,7 @@ import static org.elasticsearch.health.HealthStatus.YELLOW;
  * <ul>
  *   <li>YELLOW opt-out: no password is configured and {@code cluster.state.encryption.required} is {@code false}, meaning
  *       secrets are stored unencrypted in cluster state.</li>
- *   <li>YELLOW cannot-persist: a PEK is installed but this node lacks the password material to wrap it for disk. The next
+ *   <li>YELLOW cannot-persist: a PEK is installed but this node lacks a usable password to wrap it for disk. The next
  *       cluster-state persist on this node will fail, and the node will not survive a restart without the password.</li>
  * </ul>
  * If the elected master holds no key, encryption is unavailable on every node: RED if encrypted data exists, YELLOW otherwise.

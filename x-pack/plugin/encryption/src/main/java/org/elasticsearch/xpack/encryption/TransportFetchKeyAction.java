@@ -29,11 +29,9 @@ import org.elasticsearch.tasks.Task;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.transport.AbstractTransportRequest;
 import org.elasticsearch.transport.TransportService;
-import org.elasticsearch.xpack.encryption.ProjectEncryptionKeyMetadata.KeyEntry;
 
 import java.io.IOException;
 import java.util.List;
-import java.util.Map;
 
 /**
  * Asks nodes for the project encryption keys they hold on disk for a given active key. An elected master that could not read the key
@@ -87,7 +85,7 @@ public class TransportFetchKeyAction extends TransportNodesAction<
 
     @Override
     protected NodeResponse newNodeResponse(StreamInput in, DiscoveryNode node) throws IOException {
-        return new NodeResponse(in);
+        return new NodeResponse(in, pekEncryption);
     }
 
     @Override
@@ -108,35 +106,10 @@ public class TransportFetchKeyAction extends TransportNodesAction<
             return new NodeResponse(localNode, null);
         }
         try {
-            ProjectEncryptionKeyMetadata keys = pekEncryption.gatewayKeysFor(request.activeKeyId);
-            return keys == null
-                ? new NodeResponse(localNode, null)
-                : new NodeResponse(
-                    localNode,
-                    new Keys(keys.getKeys(), keys.getActiveKeyId(), keys.getPasswordId(), keys.getHandlerKeyIds())
-                );
+            return new NodeResponse(localNode, ProjectEncryptionKeyMetadata.unwrapGatewayKeys(request.activeKeyId, pekEncryption));
         } catch (Exception e) {
             logger.debug(() -> Strings.format("cannot unwrap this node's copy of project encryption key [%s]", request.activeKeyId), e);
             return new NodeResponse(localNode, null);
-        }
-    }
-
-    /** The plaintext keys a node holds for the requested active key. */
-    record Keys(Map<String, KeyEntry> keys, String activeKeyId, String passwordId, Map<String, String> handlerKeyIds) {
-        Keys(StreamInput in) throws IOException {
-            this(
-                in.readImmutableMap(StreamInput::readString, KeyEntry::new),
-                in.readString(),
-                in.readString(),
-                in.readImmutableMap(StreamInput::readString, StreamInput::readString)
-            );
-        }
-
-        void writeTo(StreamOutput out) throws IOException {
-            out.writeMap(keys, StreamOutput::writeString, (o, e) -> e.writeTo(o));
-            out.writeString(activeKeyId);
-            out.writeString(passwordId);
-            out.writeMap(handlerKeyIds, StreamOutput::writeString, StreamOutput::writeString);
         }
     }
 
@@ -149,10 +122,6 @@ public class TransportFetchKeyAction extends TransportNodesAction<
             super(nodes);
             this.activeKeyId = activeKeyId;
             this.nodes = List.of(nodes);
-        }
-
-        String activeKeyId() {
-            return activeKeyId;
         }
 
         List<DiscoveryNode> nodes() {
@@ -195,29 +164,30 @@ public class TransportFetchKeyAction extends TransportNodesAction<
         }
     }
 
+    /** Carries the plaintext keys a node holds for the requested active key, if any. */
     public static class NodeResponse extends BaseNodeResponse {
         @Nullable
-        private final Keys keys;
+        private final ProjectEncryptionKeyMetadata keys;
 
-        NodeResponse(DiscoveryNode node, @Nullable Keys keys) {
+        NodeResponse(DiscoveryNode node, @Nullable ProjectEncryptionKeyMetadata keys) {
             super(node);
             this.keys = keys;
         }
 
-        NodeResponse(StreamInput in) throws IOException {
+        NodeResponse(StreamInput in, ProjectEncryptionKeyMetadata.PekEncryption pekEncryption) throws IOException {
             super(in);
-            this.keys = in.readOptional(Keys::new);
+            this.keys = in.readOptional(i -> new ProjectEncryptionKeyMetadata(i, pekEncryption));
         }
 
         @Nullable
-        Keys keys() {
+        ProjectEncryptionKeyMetadata keys() {
             return keys;
         }
 
         @Override
         public void writeTo(StreamOutput out) throws IOException {
             super.writeTo(out);
-            out.writeOptional((o, k) -> k.writeTo(o), keys);
+            out.writeOptionalWriteable(keys);
         }
     }
 }

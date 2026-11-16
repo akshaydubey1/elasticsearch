@@ -628,21 +628,10 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
             new TransportFetchKeyAction.Request(activeKeyId, nodes),
             ActionListener.wrap(response -> {
                 for (TransportFetchKeyAction.NodeResponse nodeResponse : response.getNodes()) {
-                    TransportFetchKeyAction.Keys keys = nodeResponse.keys();
-                    if (keys != null && keys.activeKeyId().equals(activeKeyId)) {
+                    ProjectEncryptionKeyMetadata keys = nodeResponse.keys();
+                    if (keys != null && keys.getActiveKeyId().equals(activeKeyId)) {
                         logger.info("restoring project encryption key [{}] from node [{}]", activeKeyId, nodeResponse.getNode().getName());
-                        submitTaskIfOpen(
-                            "restore-project-encryption-keys",
-                            new RestoreKeysTask(
-                                new ProjectEncryptionKeyMetadata(
-                                    keys.keys(),
-                                    keys.activeKeyId(),
-                                    keys.passwordId(),
-                                    keys.handlerKeyIds(),
-                                    pekEncryption
-                                )
-                            )
-                        );
+                        submitTaskIfOpen("restore-project-encryption-keys", new RestoreKeysTask(keys));
                         fetchRetryDelay.set(INSTALL_RETRY_INTERVAL);
                         return;
                     }

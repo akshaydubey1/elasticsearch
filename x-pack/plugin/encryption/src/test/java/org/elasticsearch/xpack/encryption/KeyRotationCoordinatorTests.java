@@ -40,8 +40,6 @@ import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.test.MockLog;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.xcontent.ToXContent;
-import org.elasticsearch.xcontent.XContentBuilder;
-import org.elasticsearch.xcontent.json.JsonXContent;
 import org.elasticsearch.xpack.encryption.ProjectEncryptionKeyMetadata.KeyEntry;
 import org.elasticsearch.xpack.encryption.spi.EncryptedData;
 import org.elasticsearch.xpack.encryption.spi.EncryptedDataHandler;
@@ -130,7 +128,7 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
     private AtomicReference<Settings> settingsRef;
     private ThreadPool threadPool;
     private Predicate<DiscoveryNode> canPersist = node -> true;
-    private Function<DiscoveryNode, TransportFetchKeyAction.Keys> keysOnDisk = node -> null;
+    private Function<DiscoveryNode, ProjectEncryptionKeyMetadata> keysOnDisk = node -> null;
     private final AtomicInteger fetches = new AtomicInteger();
     private String failFetchFrom;
 
@@ -242,17 +240,21 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
     public void testResetForgetsThisNodesCopyOfTheKey() throws IOException {
         ProjectEncryptionKeyMetadata.GatewayKeys keys = new ProjectEncryptionKeyMetadata.GatewayKeys();
         pekEncryption = TestPekEncryption.onNode(NO_OP_ENCRYPTION, keys);
-        ProjectEncryptionKeyMetadata existing = new ProjectEncryptionKeyMetadata(Map.of("k1", entry(0L)), "k1", PASSWORD_ID, Map.of(), pekEncryption);
-        ToXContent.Params gateway = new ToXContent.MapParams(Map.of(Metadata.CONTEXT_MODE_PARAM, Metadata.CONTEXT_MODE_GATEWAY));
-        try (XContentBuilder builder = JsonXContent.contentBuilder().startObject()) {
-            for (Iterator<? extends ToXContent> it = existing.toXContentChunked(gateway); it.hasNext();) {
-                it.next().toXContent(builder, gateway);
-            }
-        }
+        ProjectEncryptionKeyMetadata existing = new ProjectEncryptionKeyMetadata(
+            Map.of("k1", entry(0L)),
+            "k1",
+            PASSWORD_ID,
+            Map.of(),
+            pekEncryption
+        );
+        // writing to disk records this node's copy
+        existing.toXContentChunked(new ToXContent.MapParams(Map.of(Metadata.CONTEXT_MODE_PARAM, Metadata.CONTEXT_MODE_GATEWAY)));
         assertEquals(Boolean.TRUE, keys.holdsKeys());
         setup(clusterStateWith(existing, false), 0L, TimeValue.timeValueDays(30));
 
-        coordinator.onClusterStateChanged(new ClusterChangedEvent("test", clusterStateWith(null, false), clusterStateWith(existing, false)));
+        coordinator.onClusterStateChanged(
+            new ClusterChangedEvent("test", clusterStateWith(null, false), clusterStateWith(existing, false))
+        );
 
         assertNull(keys.holdsKeys());
     }
@@ -270,7 +272,6 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
     }
 
     /** The master installs the first key only once every node can persist it, and asks again until they can. */
-    @SuppressWarnings("unchecked")
     public void testInstallWaitsUntilEveryNodeCanPersistTheKey() {
         FeatureService featureService = mock(FeatureService.class);
         when(featureService.clusterHasFeature(any(), any())).thenReturn(true);
@@ -305,7 +306,7 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
     public void testElectedMasterWithoutKeyRestoresItFromAnotherNode() {
         byte[] keyBytes = randomKey();
         keysOnDisk = node -> node.getId().equals("other")
-            ? new TransportFetchKeyAction.Keys(Map.of("k1", new KeyEntry(keyBytes, 1L)), "k1", PASSWORD_ID, Map.of())
+            ? new ProjectEncryptionKeyMetadata(Map.of("k1", new KeyEntry(keyBytes, 1L)), "k1", PASSWORD_ID, Map.of(), NO_OP_ENCRYPTION)
             : null;
         ClusterState state = clusterStateWith(ProjectEncryptionKeyMetadata.degraded("k1", PASSWORD_ID, NO_OP_ENCRYPTION, "no key"), true);
         setup(state, 0L, TimeValue.timeValueDays(30));
@@ -326,7 +327,6 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
     }
 
     /** A node that holds the key may not have answered, so a fetch with node failures is retried. */
-    @SuppressWarnings("unchecked")
     public void testFetchIsRetriedWhenANodeDidNotAnswer() {
         ClusterState state = clusterStateWith(ProjectEncryptionKeyMetadata.degraded("k1", PASSWORD_ID, NO_OP_ENCRYPTION, "no key"), true);
         setup(state, 0L, TimeValue.timeValueDays(30));
@@ -337,7 +337,7 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
         verify(threadPool).schedule(retry.capture(), eq(KeyRotationCoordinator.INSTALL_RETRY_INTERVAL), any());
 
         failFetchFrom = null;
-        keysOnDisk = node -> new TransportFetchKeyAction.Keys(Map.of("k1", entry(1L)), "k1", PASSWORD_ID, Map.of());
+        keysOnDisk = node -> new ProjectEncryptionKeyMetadata(Map.of("k1", entry(1L)), "k1", PASSWORD_ID, Map.of(), NO_OP_ENCRYPTION);
         retry.getValue().run();
         assertEquals(2, fetches.get());
         verify(taskQueue).submitTask(eq("restore-project-encryption-keys"), isA(KeyRotationCoordinator.RestoreKeysTask.class), any());
