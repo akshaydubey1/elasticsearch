@@ -26,6 +26,7 @@ import org.elasticsearch.cluster.ProjectState;
 import org.elasticsearch.cluster.SimpleBatchedExecutor;
 import org.elasticsearch.cluster.metadata.Metadata;
 import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.node.DiscoveryNodeRole;
 import org.elasticsearch.cluster.project.ProjectResolver;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.cluster.service.MasterService;
@@ -475,11 +476,14 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
     }
 
     /**
-     * Returns whether {@code node} writes cluster state to its own disk, and so must be able to persist the key. Only master-eligible and
-     * data nodes persist cluster state, and in serverless only the elected master does, to the object store.
+     * Returns whether a node with {@code roles} writes cluster state to its own disk, and so must be able to persist the key. Mirrors
+     * {@link org.elasticsearch.gateway.GatewayMetaState}, which gives master-eligible and data nodes an on-disk persisted state, unless a
+     * {@link org.elasticsearch.plugins.ClusterCoordinationPlugin} supplies the persisted state; only serverless does, so {@code stateless}
+     * stands in for that.
      */
-    static boolean persistsClusterState(DiscoveryNode node, boolean stateless) {
-        return stateless == false && (node.isMasterNode() || node.canContainData());
+    static boolean persistsClusterState(Set<DiscoveryNodeRole> roles, boolean stateless) {
+        return stateless == false
+            && (roles.contains(DiscoveryNodeRole.MASTER_ROLE) || roles.stream().anyMatch(DiscoveryNodeRole::canContainData));
     }
 
     private void scheduleInstall(String passwordId, ClusterState state) {
@@ -500,7 +504,7 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
         DiscoveryNode[] nodes = state.nodes()
             .getAllNodes()
             .stream()
-            .filter(node -> persistsClusterState(node, stateless))
+            .filter(node -> persistsClusterState(node.getRoles(), stateless))
             .toArray(DiscoveryNode[]::new);
         if (nodes.length == 0) {
             submitInstall(passwordId, null);
@@ -879,7 +883,9 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
                 && clusterState.nodes()
                     .getAllNodes()
                     .stream()
-                    .anyMatch(node -> persistsClusterState(node, false) && task.readyNodeIds().contains(node.getId()) == false)) {
+                    .anyMatch(
+                        node -> persistsClusterState(node.getRoles(), false) && task.readyNodeIds().contains(node.getId()) == false
+                    )) {
                 logger.debug("dropping project encryption key install: a node joined since the readiness check");
                 return Tuple.tuple(clusterState, null);
             }

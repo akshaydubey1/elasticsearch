@@ -12,17 +12,21 @@ import org.elasticsearch.cluster.metadata.Metadata;
 import org.elasticsearch.cluster.metadata.ProjectMetadata;
 import org.elasticsearch.cluster.project.DefaultProjectResolver;
 import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.settings.MockSecureSettings;
+import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.health.HealthIndicatorResult;
 import org.elasticsearch.health.HealthStatus;
 import org.elasticsearch.health.SimpleHealthIndicatorDetails;
 import org.elasticsearch.health.node.HealthInfo;
 import org.elasticsearch.test.ESTestCase;
+import org.elasticsearch.xcontent.ToXContent;
 import org.elasticsearch.xpack.encryption.spi.EncryptedData;
 import org.elasticsearch.xpack.encryption.spi.EncryptedDataHandler;
 import org.elasticsearch.xpack.encryption.spi.EncryptionServiceState;
 
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.UnaryOperator;
 
 import static org.mockito.Mockito.mock;
@@ -32,6 +36,18 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
 
     private static final String PASSWORD_ID = "v1";
     private static final ProjectEncryptionKeyMetadata.PekEncryption NO_OP_ENCRYPTION = TestPekEncryption.NO_OP;
+    // at least 14 characters, as FIPS requires
+    private static final Settings PASSWORD_SETTINGS = passwordSettings();
+    private static final ToXContent.Params GATEWAY = new ToXContent.MapParams(
+        Map.of(Metadata.CONTEXT_MODE_PARAM, Metadata.CONTEXT_MODE_GATEWAY)
+    );
+
+    private static Settings passwordSettings() {
+        MockSecureSettings secure = new MockSecureSettings();
+        secure.setString(ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY, PASSWORD_ID);
+        secure.setString(ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX + PASSWORD_ID, "test-password-fips");
+        return Settings.builder().setSecureSettings(secure).build();
+    }
 
     private static byte[] randomKeyBytes() {
         return randomByteArrayOfLength(PasswordBasedEncryption.PEK_LENGTH_BYTES);
@@ -75,14 +91,21 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
     }
 
     private static ProjectEncryptionKeyHealthIndicatorService indicator(ClusterState state, ProjectEncryptionKeyService pekService) {
+        return indicator(state, pekService, new PasswordPekEncryption(() -> PASSWORD_SETTINGS), List.of());
+    }
+
+    private static ProjectEncryptionKeyHealthIndicatorService indicator(
+        ClusterState state,
+        ProjectEncryptionKeyService pekService,
+        PasswordPekEncryption pekEncryption,
+        List<EncryptedDataHandler<?>> handlers
+    ) {
         return new ProjectEncryptionKeyHealthIndicatorService(
             mockClusterService(state),
             DefaultProjectResolver.INSTANCE,
             pekService,
-            () -> true,
-            () -> null,
-            () -> false,
-            new EncryptedDataHandlerRegistry(List.of())
+            pekEncryption,
+            new EncryptedDataHandlerRegistry(handlers)
         );
     }
 
@@ -151,14 +174,11 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
         ProjectEncryptionKeyMetadata metadata = pekMetadata(PASSWORD_ID);
         ClusterState state = stateWith(metadata);
 
-        ProjectEncryptionKeyHealthIndicatorService indicator = new ProjectEncryptionKeyHealthIndicatorService(
-            mockClusterService(state),
-            DefaultProjectResolver.INSTANCE,
+        ProjectEncryptionKeyHealthIndicatorService indicator = indicator(
+            state,
             mockPekService(EncryptionServiceState.READY, null),
-            () -> false,
-            () -> null,
-            () -> false,
-            new EncryptedDataHandlerRegistry(List.of())
+            new PasswordPekEncryption(() -> Settings.EMPTY),
+            List.of()
         );
 
         HealthIndicatorResult result = indicator.calculate(false, 1, HealthInfo.EMPTY_HEALTH_INFO);
@@ -194,14 +214,11 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
             }
         };
 
-        ProjectEncryptionKeyHealthIndicatorService indicator = new ProjectEncryptionKeyHealthIndicatorService(
-            mockClusterService(state),
-            DefaultProjectResolver.INSTANCE,
+        ProjectEncryptionKeyHealthIndicatorService indicator = indicator(
+            state,
             mockPekService(EncryptionServiceState.UNAVAILABLE_DECRYPTION_FAILED, PASSWORD_ID),
-            () -> true,
-            () -> null,
-            () -> false,
-            new EncryptedDataHandlerRegistry(List.of(handler))
+            new PasswordPekEncryption(() -> PASSWORD_SETTINGS),
+            List.of(handler)
         );
 
         HealthIndicatorResult result = indicator.calculate(true, 1, HealthInfo.EMPTY_HEALTH_INFO);
@@ -238,22 +255,41 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
         assertEquals(EncryptionServiceState.READY.displayValue(), detailsMap(result).get("state"));
     }
 
+    /** Reports whether this node holds a copy of the key on disk, and whether it has the password to read it. */
     public void testKeyOnDiskDetails() {
-        Boolean keyOnDisk = randomFrom(true, false, null);
-        boolean canRead = randomBoolean();
-        ProjectEncryptionKeyHealthIndicatorService indicator = new ProjectEncryptionKeyHealthIndicatorService(
-            mockClusterService(stateWith(pekMetadata(PASSWORD_ID))),
-            DefaultProjectResolver.INSTANCE,
+        AtomicReference<Settings> settings = new AtomicReference<>(PASSWORD_SETTINGS);
+        PasswordPekEncryption pekEncryption = new PasswordPekEncryption(settings::get);
+        String keyId = ProjectEncryptionKeyMetadata.generateKeyId();
+        ProjectEncryptionKeyMetadata metadata = new ProjectEncryptionKeyMetadata(
+            Map.of(keyId, new ProjectEncryptionKeyMetadata.KeyEntry(randomKeyBytes(), 0L)),
+            keyId,
+            PASSWORD_ID,
+            Map.of(),
+            pekEncryption
+        );
+        ProjectEncryptionKeyHealthIndicatorService indicator = indicator(
+            stateWith(metadata),
             mockPekService(EncryptionServiceState.READY, PASSWORD_ID),
-            () -> true,
-            () -> keyOnDisk,
-            () -> canRead,
-            new EncryptedDataHandlerRegistry(List.of())
+            pekEncryption,
+            List.of()
+        );
+        assertFalse(
+            "nothing read or written yet",
+            detailsMap(indicator.calculate(true, 1, HealthInfo.EMPTY_HEALTH_INFO)).containsKey("key_on_disk")
         );
 
+        ProjectEncryptionKeyMetadata.degraded("other", PASSWORD_ID, pekEncryption, "no key").toXContentChunked(GATEWAY);
         Map<String, Object> details = detailsMap(indicator.calculate(true, 1, HealthInfo.EMPTY_HEALTH_INFO));
-        assertEquals(keyOnDisk, details.get("key_on_disk"));
-        assertEquals(Boolean.TRUE.equals(keyOnDisk) ? canRead : null, details.get("can_read_key_on_disk"));
+        assertEquals(false, details.get("key_on_disk"));
+        assertFalse(details.containsKey("can_read_key_on_disk"));
+
+        metadata.toXContentChunked(GATEWAY);
+        details = detailsMap(indicator.calculate(true, 1, HealthInfo.EMPTY_HEALTH_INFO));
+        assertEquals(true, details.get("key_on_disk"));
+        assertEquals(true, details.get("can_read_key_on_disk"));
+
+        settings.set(Settings.EMPTY);
+        assertEquals(false, detailsMap(indicator.calculate(true, 1, HealthInfo.EMPTY_HEALTH_INFO)).get("can_read_key_on_disk"));
     }
 
     private static Map<String, Object> detailsMap(HealthIndicatorResult result) {

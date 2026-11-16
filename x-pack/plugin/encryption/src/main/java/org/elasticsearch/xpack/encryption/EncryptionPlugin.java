@@ -70,8 +70,10 @@ public class EncryptionPlugin extends Plugin
     private final PasswordPekEncryption pekEncryption = new PasswordPekEncryption(() -> this.pekSettings);
 
     public EncryptionPlugin(Settings settings) {
-        this.persistsClusterState = DiscoveryNode.isStateless(settings) == false
-            && (DiscoveryNode.isMasterNode(settings) || DiscoveryNode.canContainData(settings));
+        this.persistsClusterState = KeyRotationCoordinator.persistsClusterState(
+            DiscoveryNode.getRolesFromSettings(settings),
+            DiscoveryNode.isStateless(settings)
+        );
         this.pekSettings = ProjectEncryptionKeyPasswordSettings.cloneSettings(settings);
         // Clear any service left in the registry by a previously constructed plugin instance (e.g. a prior node in the same test JVM),
         // so this node's createComponents publishes into a clean slot.
@@ -117,9 +119,7 @@ public class EncryptionPlugin extends Plugin
             services.clusterService(),
             services.projectResolver(),
             pekService,
-            pekEncryption::canWrapForDisk,
-            pekEncryption.gatewayKeys()::holdsKeys,
-            pekEncryption::canReadKeyOnDisk,
+            pekEncryption,
             handlerRegistry
         );
 
