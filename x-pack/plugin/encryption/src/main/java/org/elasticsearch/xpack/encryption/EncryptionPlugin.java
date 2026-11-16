@@ -199,7 +199,7 @@ public class EncryptionPlugin extends Plugin
                         + ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY
                         + "] and the matching ["
                         + ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX
-                        + "<id>] secure setting in this node's keystore and restart it"
+                        + "<id>] secure setting in this node's keystore, then restart it or reload its secure settings"
                 );
             }
         };
