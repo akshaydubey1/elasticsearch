@@ -300,13 +300,10 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
     }
 
     /** A secure settings reload on the master, as for a cluster-wide reload, ends the wait for the retry. */
-    public void testInstallRetriedShortlyAfterReload() {
+    public void testInstallRetriedOnReload() {
         Runnable scheduledRetry = installWaitingForOther();
 
         coordinator.reload();
-        ArgumentCaptor<Runnable> retry = ArgumentCaptor.forClass(Runnable.class);
-        verify(threadPool).schedule(retry.capture(), eq(KeyRotationCoordinator.RELOAD_INSTALL_RETRY_DELAY), any());
-        retry.getValue().run();
         verify(taskQueue).submitTask(eq("install-project-encryption-key"), isA(KeyRotationCoordinator.InstallKeyTask.class), any());
 
         scheduledRetry.run();

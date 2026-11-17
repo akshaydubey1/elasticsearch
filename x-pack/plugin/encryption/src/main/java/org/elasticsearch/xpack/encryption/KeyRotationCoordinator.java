@@ -61,9 +61,24 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /**
- * Owns the PEK lifecycle on the elected master: installs the initial key, rotates the active key on a timer, updates
- * {@link ProjectEncryptionKeyMetadata#getPasswordId()} when the active password changes, drives registered
- * {@link EncryptedDataHandler}s to re-encrypt their data, and retires expired non-active keys.
+ * Owns the project encryption key (PEK) lifecycle on the elected master.
+ * <ul>
+ *   <li><b>Install</b>: with no key and an active password configured, the master asks every node that persists cluster state whether
+ *   it can wrap the key ({@link TransportCanPersistKeyAction}) and installs one only once all can. {@link InstallKeyTask} is dropped if
+ *   such a node joined since the check.</li>
+ *   <li><b>Install retry</b>: while a node can't, the master asks again after {@link #INSTALL_RETRY_INTERVAL}, or right away when it
+ *   reloads its secure settings or a node that persists cluster state joins or leaves.</li>
+ *   <li><b>Install recheck</b>: an install requested while a check is in flight, e.g. by a join, runs once that check completes.</li>
+ *   <li><b>Join condition</b>: once the key is installed, a node that persists cluster state but can't wrap the key can't join
+ *   ({@link EncryptionPlugin#getJoinValidator()}).</li>
+ *   <li><b>Key rotation</b>: once the active key is older than {@link #ROTATION_INTERVAL_SETTING}, a new key becomes active, the
+ *   registered {@link EncryptedDataHandler}s re-encrypt their data under it, and keys no longer in use are retired.</li>
+ *   <li><b>Password rotation</b>: when the active password id changes, {@link ProjectEncryptionKeyMetadata#getPasswordId()} follows.</li>
+ *   <li><b>Restore</b>: a master that can't read the key on its disk after a restart holds no key
+ *   ({@link ProjectEncryptionKeyMetadata#isUnwrapFailed()}) and drops every other task. It reads the key from its disk once a secure
+ *   settings reload gives it the password.</li>
+ *   <li><b>Reset</b>: on every node, not only the master, forgets this node's copy of a key that a reset removed.</li>
+ * </ul>
  *
  * <p>Re-encryption uses a compute-then-CAS pattern: each handler re-encrypts against a cluster-state snapshot on the generic pool, then
  * a {@link ReEncryptApplyTask} atomically applies the result — aborting if the snapshot is stale. Conflicts retry on the next tick.
@@ -75,9 +90,8 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
     // Number of check_intervals a non-active key persists after its deactivation time before retirement.
     private static final int GRACE_TICKS = 10;
 
+    // how long the master waits before asking again whether every node can persist the key, while some cannot
     static final TimeValue INSTALL_RETRY_INTERVAL = TimeValue.timeValueSeconds(10);
-    // lets the other nodes finish a cluster-wide secure settings reload before the master asks them again
-    static final TimeValue RELOAD_INSTALL_RETRY_DELAY = TimeValue.timeValueSeconds(1);
 
     /**
      * How frequently the project encryption key is rotated. {@link TimeValue#ZERO} disables rotation.
@@ -228,7 +242,8 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
             if (closed) return;
             Object retry = pendingInstallRetry.get();
             if (retry != null) {
-                threadPool.schedule(() -> retryInstall(retry), RELOAD_INSTALL_RETRY_DELAY, threadPool.generic());
+                retryInstall(retry);
+                return;
             }
             ClusterState state = clusterService.state();
             if (state.blocks().hasGlobalBlock(GatewayService.STATE_NOT_RECOVERED_BLOCK)
@@ -810,7 +825,7 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
         public Tuple<ClusterState, Void> executeTask(KeyRotationTask task, ClusterState clusterState) {
             ProjectState projectState = projectResolver.getProjectState(clusterState);
             ProjectEncryptionKeyMetadata existing = projectState.metadata().custom(ProjectEncryptionKeyMetadata.TYPE);
-            // key-less metadata would turn into metadata that holds only a new key, losing the keys other nodes still hold
+            // while the master holds no key, any other task would publish metadata without the keys still on the nodes' disks
             if (existing != null && existing.isUnwrapFailed() && task instanceof RestoreKeysTask == false) {
                 logger.debug("dropping [{}]: the elected master holds no project encryption key", task.description());
                 return Tuple.tuple(clusterState, null);
