@@ -6,6 +6,7 @@
  */
 package org.elasticsearch.xpack.encryption;
 
+import org.elasticsearch.xpack.encryption.ProjectEncryptionKeyMetadata.GatewayKeys;
 import org.elasticsearch.xpack.encryption.ProjectEncryptionKeyMetadata.PekEncryption;
 import org.elasticsearch.xpack.encryption.ProjectEncryptionKeyMetadata.PekEncryption.WrappedKey;
 
@@ -36,6 +37,31 @@ class TestPekEncryption {
             return wrappedPek.clone();
         }
     };
+
+    /** Returns {@code delegate} with its own {@link GatewayKeys}, like one node's {@link PasswordPekEncryption}. */
+    static PekEncryption onNode(PekEncryption delegate, GatewayKeys gatewayKeys) {
+        return new PekEncryption() {
+            @Override
+            public String activePasswordId() {
+                return delegate.activePasswordId();
+            }
+
+            @Override
+            public WrappedKey wrap(byte[] plaintextPek) {
+                return delegate.wrap(plaintextPek);
+            }
+
+            @Override
+            public byte[] unwrap(byte[] wrappedPek, String passwordId) {
+                return delegate.unwrap(wrappedPek, passwordId);
+            }
+
+            @Override
+            public GatewayKeys gatewayKeys() {
+                return gatewayKeys;
+            }
+        };
+    }
 
     private TestPekEncryption() {}
 }

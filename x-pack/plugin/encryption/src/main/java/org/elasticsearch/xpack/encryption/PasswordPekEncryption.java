@@ -7,10 +7,15 @@
 package org.elasticsearch.xpack.encryption;
 
 import org.elasticsearch.ElasticsearchException;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.node.DiscoveryNodeRole;
+import org.elasticsearch.common.settings.ClusterSecrets;
 import org.elasticsearch.common.settings.SecureString;
 import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.xpack.encryption.spi.EncryptedData;
 
+import java.util.Set;
 import java.util.function.Supplier;
 
 /**
@@ -20,12 +25,63 @@ import java.util.function.Supplier;
  * <p>The active password id and password material are sourced from a {@link Supplier} so that secure-settings reloads are reflected
  * automatically: the supplier is re-evaluated on every call.
  */
-final class PasswordPekEncryption implements ProjectEncryptionKeyMetadata.PekEncryption {
+public final class PasswordPekEncryption implements ProjectEncryptionKeyMetadata.PekEncryption {
 
     private final Supplier<Settings> settingsSupplier;
+    private final ProjectEncryptionKeyMetadata.GatewayKeys gatewayKeys = new ProjectEncryptionKeyMetadata.GatewayKeys();
+
+    private record WrapCheck(Settings settings, @Nullable String failure) {}
+
+    private volatile WrapCheck wrapCheck;
 
     PasswordPekEncryption(Supplier<Settings> settingsSupplier) {
         this.settingsSupplier = settingsSupplier;
+    }
+
+    @Override
+    public ProjectEncryptionKeyMetadata.GatewayKeys gatewayKeys() {
+        return gatewayKeys;
+    }
+
+    /**
+     * Returns whether a node with {@code roles} persists cluster state, and so must be able to wrap the key. Mirrors
+     * {@link org.elasticsearch.gateway.GatewayMetaState}, which gives master-eligible and data nodes an on-disk persisted state. On
+     * stateless only the elected master persists it, to the object store, so every master-eligible node must be able to.
+     */
+    static boolean persistsClusterState(Set<DiscoveryNodeRole> roles, boolean stateless) {
+        return roles.contains(DiscoveryNodeRole.MASTER_ROLE)
+            || (stateless == false && roles.stream().anyMatch(DiscoveryNodeRole::canContainData));
+    }
+
+    /**
+     * Returns whether the passwords come from {@link ClusterSecrets} in cluster state, the same on every node, rather than from each
+     * node's keystore. Then no node can lack the password the others have, so nodes aren't checked.
+     */
+    static boolean passwordsFromClusterSecrets(ClusterState state) {
+        return state.custom(ClusterSecrets.TYPE) != null;
+    }
+
+    /** Returns whether this node can write the key to its disk. */
+    boolean canWrapForDisk() {
+        return wrapForDiskFailure() == null;
+    }
+
+    /** Returns why this node cannot write the key to its disk, or {@code null} if it can. Cached per secure settings snapshot. */
+    @Nullable
+    String wrapForDiskFailure() {
+        Settings settings = settingsSupplier.get();
+        WrapCheck check = wrapCheck;
+        if (check == null || check.settings() != settings) {
+            check = new WrapCheck(settings, ProjectEncryptionKeyPasswordSettings.wrapForDiskFailure(settings));
+            wrapCheck = check;
+        }
+        return check.failure();
+    }
+
+    /** Returns whether this node has the password its on-disk copy of the key is wrapped with, so it can read the copy. */
+    boolean canReadKeyOnDisk() {
+        String passwordId = gatewayKeys.passwordId();
+        return passwordId != null && ProjectEncryptionKeyPasswordSettings.hasPassword(settingsSupplier.get(), passwordId);
     }
 
     @Override
