@@ -35,15 +35,15 @@ public class FetchPhasePolicyTests extends ESTestCase {
         }
     }
 
-    /** Without the pragma, the mode of the cluster decides. */
-    public void testTheClusterModeDecidesWithoutThePragma() {
-        assertDecision(FetchPhaseMode.DISABLED, null, CURRENT, Outcome.DISABLED_CLUSTER, FetchPhaseMode.DISABLED);
+    /** Without the pragma, the cluster's mode decides, and the setting turns on the cost decision. */
+    public void testSettingDecidesWithoutPragma() {
+        assertDecision(FetchPhaseMode.DISABLED, null, CURRENT, Outcome.DISABLED_SETTING, FetchPhaseMode.DISABLED);
         assertDecision(FetchPhaseMode.AUTO, null, CURRENT, Outcome.ENABLED, FetchPhaseMode.AUTO);
         assertDecision(FetchPhaseMode.ALWAYS, null, CURRENT, Outcome.ENABLED, FetchPhaseMode.ALWAYS);
     }
 
-    /** The pragma forces the fetch on every plan that can use it, or turns it off, whatever the cluster's mode. */
-    public void testThePragmaOverridesTheClusterMode() {
+    /** The pragma forces the fetch on every plan that can use it, or turns it off, whatever the setting says. */
+    public void testPragmaOverridesSetting() {
         assertDecision(FetchPhaseMode.DISABLED, true, CURRENT, Outcome.ENABLED, FetchPhaseMode.ALWAYS);
         assertDecision(FetchPhaseMode.AUTO, true, CURRENT, Outcome.ENABLED, FetchPhaseMode.ALWAYS);
         assertDecision(FetchPhaseMode.AUTO, false, CURRENT, Outcome.DISABLED_PRAGMA, FetchPhaseMode.DISABLED);

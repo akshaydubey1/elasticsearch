@@ -14,6 +14,7 @@ import org.elasticsearch.compute.lucene.read.FetchDocsSourceOperator;
 import org.elasticsearch.compute.lucene.read.ValuesSourceReaderOperatorStatus;
 import org.elasticsearch.compute.operator.DriverProfile;
 import org.elasticsearch.compute.operator.OperatorStatus;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.search.SearchService;
 import org.elasticsearch.xpack.esql.EsqlTestUtils;
@@ -439,6 +440,24 @@ public abstract class EsqlFetchPhaseTestCase extends AbstractEsqlIntegTestCase {
         assertFetched(run, 300);
         assertLoadedOnlyBeforeTheCut(run, "unique_sort");
         assertFetchedOnly(run, "payload");
+    }
+
+    /**
+     * The cluster setting turns the fetch phase on for queries without the pragma, where it is likely faster: a
+     * {@code TopN} over more than one shard that defers {@code _source}. A query that defers no {@code _source} stays
+     * eager.
+     */
+    public void testTheClusterSettingTurnsTheFetchPhaseOn() {
+        String withSource = "FROM " + indexName + " METADATA _source | SORT unique_sort + 1 DESC | LIMIT 5 | KEEP unique_sort, _source";
+        String withoutSource = "FROM " + indexName + " | SORT unique_sort + 1 DESC | LIMIT 5 | KEEP unique_sort, payload, category";
+        updateClusterSettings(Settings.builder().put(EsqlFlags.ESQL_FETCH_PHASE.getKey(), true));
+        try {
+            assertFetched(runQuery(withSource, null), 5);
+            assertNotFetched(runQuery(withoutSource, null));
+        } finally {
+            updateClusterSettings(Settings.builder().putNull(EsqlFlags.ESQL_FETCH_PHASE.getKey()));
+        }
+        assertNotFetched(runQuery(withSource, null));
     }
 
     /**
@@ -922,15 +941,17 @@ public abstract class EsqlFetchPhaseTestCase extends AbstractEsqlIntegTestCase {
     }
 
     /**
-     * @param fetchPhase the {@code fetch_phase} pragma
+     * @param fetchPhase the {@code fetch_phase} pragma, {@code null} to follow the cluster setting
      */
-    protected Run runQuery(String query, boolean fetchPhase) {
+    protected Run runQuery(String query, @Nullable Boolean fetchPhase) {
         // one driver per shard keeps the shards and the node reduction of the plans deterministic
         Settings.Builder pragmas = Settings.builder()
             .put(QueryPragmas.TASK_CONCURRENCY.getKey(), 1)
             .put(QueryPragmas.DATA_PARTITIONING.getKey(), "shard")
-            .put(QueryPragmas.NODE_LEVEL_REDUCTION.getKey(), nodeLevelReduction)
-            .put(QueryPragmas.FETCH_PHASE.getKey(), fetchPhase);
+            .put(QueryPragmas.NODE_LEVEL_REDUCTION.getKey(), nodeLevelReduction);
+        if (fetchPhase != null) {
+            pragmas.put(QueryPragmas.FETCH_PHASE.getKey(), fetchPhase);
+        }
         EsqlQueryRequest request = syncEsqlQueryRequest(query).acceptedPragmaRisks(true)
             .pragmas(new QueryPragmas(pragmas.build()))
             .profile(true);

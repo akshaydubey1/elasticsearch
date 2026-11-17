@@ -19,6 +19,7 @@ import org.elasticsearch.xpack.esql.expression.function.EsqlFunctionRegistry;
 import org.elasticsearch.xpack.esql.expression.function.FunctionDefinition;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.ReplaceStatsFilteredOrNullAggWithEval;
 import org.elasticsearch.xpack.esql.plugin.EsqlFeatures;
+import org.elasticsearch.xpack.esql.plugin.EsqlFlags;
 import org.elasticsearch.xpack.esql.plugin.EsqlPlugin;
 
 import java.util.HashSet;
@@ -4873,6 +4874,13 @@ public class EsqlCapabilities {
          * See <a href="https://github.com/elastic/elasticsearch/issues/160269">#160269</a>.
          */
         TS_FORK_BEFORE_STATS_NOT_SUPPORTED,
+
+        /**
+         * The fetch phase for {@code TopN} and {@code LIMIT}: with the {@code fetch_phase} pragma or the
+         * {@code esql.query.fetch_phase.enabled} setting, a query loads the columns it only needs after its cut for the rows
+         * that survive the cut. Off by default.
+         */
+        FETCH_PHASE(EsqlFlags.FETCH_PHASE_FEATURE_FLAG),
 
         // Last capability should still have a comma for fewer merge conflicts when adding new ones :)
         // This comment prevents the semicolon from being on the previous capability when Spotless formats the file.
