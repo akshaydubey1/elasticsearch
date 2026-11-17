@@ -182,6 +182,8 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
         Set<String> concreteIndices,
         OriginalIndices originalIndices,
         ExchangeSourceHandler exchangeSource,
+        // Non-null when documents leave the data nodes: each data node keeps the fetch contexts of the rows that left it
+        @Nullable TimeValue readerContextKeepAlive,
         Runnable runOnTaskFailure,
         ActionListener<ComputeResponse> outListener
     ) {
@@ -273,7 +275,10 @@ final class DataNodeComputeHandler implements TransportRequestHandler<DataNodeRe
                                 // work as the final driver.
                                 queryPragmas.nodeLevelReduction() && sameNodeAsCoordinator == false,
                                 queryPragmas.nodeLevelReduction() && enableReduceNodeLateMaterialization,
-                                sameNodeAsCoordinator && queryPragmas.singleNodeOptimizations() && Strings.isEmpty(clusterAlias)
+                                sameNodeAsCoordinator && queryPragmas.singleNodeOptimizations() && Strings.isEmpty(clusterAlias),
+                                List.of(),
+                                0L,
+                                readerContextKeepAlive
                             );
                             ThreadContext threadContext = transportService.getThreadPool().getThreadContext();
                             final var remoteSink = exchangeService.newRemoteSink(groupTask, childSessionId, transportService, connection);

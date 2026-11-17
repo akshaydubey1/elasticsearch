@@ -383,6 +383,8 @@ final class ClusterComputeHandler implements TransportRequestHandler<ClusterComp
                     concreteIndices,
                     originalIndices,
                     exchangeSource,
+                    // the fetch phase reads the local cluster only, so the data nodes of a remote cluster keep no fetch contexts
+                    null,
                     cancelQueryOnFailure,
                     computeListener.acquireCompute().map(r -> {
                         finalResponse.set(r);

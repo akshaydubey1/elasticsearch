@@ -27,6 +27,7 @@ import org.elasticsearch.compute.operator.exchange.ExchangeService;
 import org.elasticsearch.core.Predicates;
 import org.elasticsearch.indices.breaker.CircuitBreakerMetrics;
 import org.elasticsearch.indices.breaker.HierarchyCircuitBreakerService;
+import org.elasticsearch.tasks.TaskManager;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.transport.TransportService;
@@ -610,6 +611,8 @@ public class ExternalPlanningBreakerTests extends ESTestCase {
 
         TransportService transportService = mock(TransportService.class);
         when(transportService.getThreadPool()).thenReturn(threadPool);
+        // the leases of the fetch phase listen for the tasks that go away
+        when(transportService.getTaskManager()).thenReturn(new TaskManager(Settings.EMPTY, threadPool, Set.of()));
 
         Set<Setting<?>> registered = new HashSet<>(ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
         registered.add(EsqlPlugin.GROK_WATCHDOG_MAX_EXECUTION_TIME);
@@ -681,7 +684,8 @@ public class ExternalPlanningBreakerTests extends ESTestCase {
             readers,
             null,
             // Holds no node back, so every node of a state is a worker.
-            new ExternalWorkerReadiness(clusterService, null, threadPool, false)
+            new ExternalWorkerReadiness(clusterService, null, threadPool, false),
+            null
         );
     }
 
