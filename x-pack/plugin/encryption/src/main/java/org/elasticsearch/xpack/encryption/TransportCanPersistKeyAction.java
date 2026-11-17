@@ -21,14 +21,12 @@ import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.injection.guice.Inject;
 import org.elasticsearch.tasks.Task;
-import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.transport.AbstractTransportRequest;
 import org.elasticsearch.transport.TransportService;
 
 import java.io.IOException;
 import java.util.List;
 import java.util.Set;
-import java.util.TreeSet;
 import java.util.stream.Collectors;
 
 /**
@@ -53,14 +51,7 @@ public class TransportCanPersistKeyAction extends TransportNodesAction<
         ActionFilters actionFilters,
         PasswordPekEncryption pekEncryption
     ) {
-        super(
-            TYPE.name(),
-            clusterService,
-            transportService,
-            actionFilters,
-            NodeRequest::new,
-            transportService.getThreadPool().executor(ThreadPool.Names.MANAGEMENT)
-        );
+        super(TYPE.name(), clusterService, transportService, actionFilters, NodeRequest::new, transportService.getThreadPool().generic());
         this.pekEncryption = pekEncryption;
     }
 
@@ -97,13 +88,6 @@ public class TransportCanPersistKeyAction extends TransportNodesAction<
         }
     }
 
-    /** Names of the asked nodes that reported they can't persist the key, and of those that didn't answer. */
-    record NotReady(Set<String> withoutPassword, Set<String> unreachable) {
-        boolean isEmpty() {
-            return withoutPassword.isEmpty() && unreachable.isEmpty();
-        }
-    }
-
     public static class Response extends BaseNodesResponse<NodeResponse> {
         Response(ClusterName clusterName, List<NodeResponse> nodes, List<FailedNodeException> failures) {
             super(clusterName, nodes, failures);
@@ -114,21 +98,6 @@ public class TransportCanPersistKeyAction extends TransportNodesAction<
                 .filter(NodeResponse::canPersist)
                 .map(r -> r.getNode().getId())
                 .collect(Collectors.toUnmodifiableSet());
-        }
-
-        NotReady notReady(DiscoveryNode[] asked) {
-            Set<String> ready = readyNodeIds();
-            Set<String> failed = failures().stream().map(FailedNodeException::nodeId).collect(Collectors.toSet());
-            Set<String> withoutPassword = new TreeSet<>();
-            Set<String> unreachable = new TreeSet<>();
-            for (DiscoveryNode node : asked) {
-                if (failed.contains(node.getId())) {
-                    unreachable.add(node.getName());
-                } else if (ready.contains(node.getId()) == false) {
-                    withoutPassword.add(node.getName());
-                }
-            }
-            return new NotReady(withoutPassword, unreachable);
         }
 
         @Override

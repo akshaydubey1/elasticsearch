@@ -64,13 +64,13 @@ public class EncryptionPlugin extends Plugin
     private final SetOnce<ProjectEncryptionKeyService> pekService = new SetOnce<>();
     private final SetOnce<ClusterService> clusterService = new SetOnce<>();
 
-    private final boolean writesClusterStateToDisk;
+    private final boolean persistsClusterState;
     private volatile Settings pekSettings;
 
     private final PasswordPekEncryption pekEncryption = new PasswordPekEncryption(() -> this.pekSettings);
 
     public EncryptionPlugin(Settings settings) {
-        this.writesClusterStateToDisk = PasswordPekEncryption.writesClusterStateToDisk(
+        this.persistsClusterState = PasswordPekEncryption.persistsClusterState(
             DiscoveryNode.getRolesFromSettings(settings),
             DiscoveryNode.isStateless(settings)
         );
@@ -151,7 +151,7 @@ public class EncryptionPlugin extends Plugin
     @Override
     public synchronized void reload(Settings settings) {
         Settings updated = ProjectEncryptionKeyPasswordSettings.cloneSettings(settings);
-        if (writesClusterStateToDisk && clusterUsesKey()) {
+        if (persistsClusterState && clusterUsesKey()) {
             ProjectEncryptionKeyPasswordSettings.validateReload(
                 pekEncryption.canWrapForDisk(),
                 pekSettings,
@@ -179,7 +179,7 @@ public class EncryptionPlugin extends Plugin
      */
     @Override
     public BiConsumer<DiscoveryNode, ClusterState> getJoinValidator() {
-        if (writesClusterStateToDisk == false) {
+        if (persistsClusterState == false) {
             return null;
         }
         return (node, state) -> {

@@ -11,10 +11,10 @@ import org.elasticsearch.cluster.ClusterName;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.metadata.Metadata;
 import org.elasticsearch.cluster.metadata.ProjectMetadata;
+import org.elasticsearch.cluster.node.DiscoveryNodeRole;
 import org.elasticsearch.cluster.node.DiscoveryNodeUtils;
 import org.elasticsearch.cluster.node.DiscoveryNodes;
 import org.elasticsearch.cluster.project.DefaultProjectResolver;
-import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.Tuple;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.xpack.encryption.ProjectEncryptionKeyMetadata.KeyEntry;
@@ -63,7 +63,7 @@ public class KeyRotationExecutorTests extends ESTestCase {
         String newKeyId = ProjectEncryptionKeyMetadata.generateKeyId();
         long generatedAt = System.currentTimeMillis();
         Tuple<ClusterState, Void> result = executor.executeTask(
-            new KeyRotationCoordinator.InstallKeyTask(newKeyId, randomKey(), PASSWORD_ID, generatedAt, null),
+            new KeyRotationCoordinator.InstallKeyTask(newKeyId, randomKey(), PASSWORD_ID, generatedAt, Set.of()),
             state
         );
 
@@ -84,7 +84,7 @@ public class KeyRotationExecutorTests extends ESTestCase {
             NO_OP_ENCRYPTION
         );
         ClusterState state = stateWith(existing);
-        Tuple<ClusterState, Void> result = executor.executeTask(installTask(ProjectEncryptionKeyMetadata.generateKeyId(), null), state);
+        Tuple<ClusterState, Void> result = executor.executeTask(installTask(ProjectEncryptionKeyMetadata.generateKeyId(), Set.of()), state);
         assertSame(state, result.v1());
     }
 
@@ -270,7 +270,23 @@ public class KeyRotationExecutorTests extends ESTestCase {
         assertEquals(keyId, metadataOf(executor.executeTask(installTask(keyId, Set.of("ready", "joined")), state).v1()).getActiveKeyId());
     }
 
-    private static KeyRotationCoordinator.InstallKeyTask installTask(String keyId, @Nullable Set<String> readyNodeIds) {
+    /** On stateless only master-eligible nodes persist cluster state, to the object store, so only they must be ready. */
+    public void testStatelessInstallRequiresEveryMasterEligibleNodeToBeReady() {
+        var statelessExecutor = new KeyRotationCoordinator.KeyRotationExecutor(DefaultProjectResolver.INSTANCE, NO_OP_ENCRYPTION, true);
+        ClusterState state = ClusterState.builder(stateWith(null))
+            .nodes(
+                DiscoveryNodes.builder()
+                    .add(DiscoveryNodeUtils.builder("master").roles(Set.of(DiscoveryNodeRole.MASTER_ROLE)).build())
+                    .add(DiscoveryNodeUtils.builder("index").roles(Set.of(DiscoveryNodeRole.INDEX_ROLE)).build())
+                    .add(DiscoveryNodeUtils.builder("search").roles(Set.of(DiscoveryNodeRole.SEARCH_ROLE)).build())
+            )
+            .build();
+        String keyId = ProjectEncryptionKeyMetadata.generateKeyId();
+        assertSame(state, statelessExecutor.executeTask(installTask(keyId, Set.of()), state).v1());
+        assertEquals(keyId, metadataOf(statelessExecutor.executeTask(installTask(keyId, Set.of("master")), state).v1()).getActiveKeyId());
+    }
+
+    private static KeyRotationCoordinator.InstallKeyTask installTask(String keyId, Set<String> readyNodeIds) {
         return new KeyRotationCoordinator.InstallKeyTask(keyId, randomKey(), PASSWORD_ID, 0L, readyNodeIds);
     }
 

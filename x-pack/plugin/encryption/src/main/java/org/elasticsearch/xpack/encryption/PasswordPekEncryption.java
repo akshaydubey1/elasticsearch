@@ -42,14 +42,13 @@ public final class PasswordPekEncryption implements ProjectEncryptionKeyMetadata
     }
 
     /**
-     * Returns whether a node with {@code roles} writes cluster state to its own disk, and so must be able to wrap the key for disk. Mirrors
-     * {@link org.elasticsearch.gateway.GatewayMetaState}, which gives master-eligible and data nodes an on-disk persisted state, unless a
-     * {@link org.elasticsearch.plugins.ClusterCoordinationPlugin} supplies the persisted state; only serverless does, so {@code stateless}
-     * stands in for that.
+     * Returns whether a node with {@code roles} persists cluster state, and so must be able to wrap the key. Mirrors
+     * {@link org.elasticsearch.gateway.GatewayMetaState}, which gives master-eligible and data nodes an on-disk persisted state. On
+     * stateless only master-eligible nodes persist it, to the object store when elected, and they wrap the key with their own password.
      */
-    static boolean writesClusterStateToDisk(Set<DiscoveryNodeRole> roles, boolean stateless) {
-        return stateless == false
-            && (roles.contains(DiscoveryNodeRole.MASTER_ROLE) || roles.stream().anyMatch(DiscoveryNodeRole::canContainData));
+    static boolean persistsClusterState(Set<DiscoveryNodeRole> roles, boolean stateless) {
+        return roles.contains(DiscoveryNodeRole.MASTER_ROLE)
+            || (stateless == false && roles.stream().anyMatch(DiscoveryNodeRole::canContainData));
     }
 
     /** Returns whether this node can write the key to its disk. */
