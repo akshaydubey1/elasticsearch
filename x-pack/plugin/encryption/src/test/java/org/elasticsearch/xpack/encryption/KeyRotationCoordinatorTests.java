@@ -284,6 +284,53 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
         assertEquals(Set.of("local", "other"), ((KeyRotationCoordinator.InstallKeyTask) install.getValue()).readyNodeIds());
     }
 
+    /** A node that persists cluster state restarting, here with a password, ends the wait for the retry. */
+    public void testInstallRetriedWhenANodeThatPersistsClusterStateRestarts() {
+        Runnable scheduledRetry = installWaitingForOther();
+
+        ClusterState state = clusterStateWith(null, true);
+        ClusterState restarted = ClusterState.builder(state)
+            .nodes(DiscoveryNodes.builder(state.nodes()).remove("other").add(DiscoveryNodeUtils.create("other", "other")))
+            .build();
+        coordinator.onClusterStateChanged(new ClusterChangedEvent("test", restarted, state));
+        verify(taskQueue).submitTask(eq("install-project-encryption-key"), isA(KeyRotationCoordinator.InstallKeyTask.class), any());
+
+        scheduledRetry.run();
+        verify(taskQueue, times(1)).submitTask(anyString(), any(), any());
+    }
+
+    /** A secure settings reload on the master, as for a cluster-wide reload, ends the wait for the retry. */
+    public void testInstallRetriedShortlyAfterReload() {
+        Runnable scheduledRetry = installWaitingForOther();
+
+        coordinator.reload();
+        ArgumentCaptor<Runnable> retry = ArgumentCaptor.forClass(Runnable.class);
+        verify(threadPool).schedule(retry.capture(), eq(KeyRotationCoordinator.RELOAD_INSTALL_RETRY_DELAY), any());
+        retry.getValue().run();
+        verify(taskQueue).submitTask(eq("install-project-encryption-key"), isA(KeyRotationCoordinator.InstallKeyTask.class), any());
+
+        scheduledRetry.run();
+        verify(taskQueue, times(1)).submitTask(anyString(), any(), any());
+    }
+
+    /**
+     * Starts an install that waits because node "other" cannot persist the key, then lets every node persist it. Returns the retry
+     * scheduled after {@link KeyRotationCoordinator#INSTALL_RETRY_INTERVAL}.
+     */
+    private Runnable installWaitingForOther() {
+        FeatureService featureService = mock(FeatureService.class);
+        when(featureService.clusterHasFeature(any(), any())).thenReturn(true);
+        ClusterState state = clusterStateWith(null, true);
+        setup(state, 0L, TimeValue.timeValueDays(30), TimeValue.timeValueMinutes(1), featureService);
+        canPersist = node -> node.getId().equals("other") == false;
+        coordinator.onClusterStateChanged(new ClusterChangedEvent("test", state, state));
+        verify(taskQueue, never()).submitTask(anyString(), any(), any());
+        ArgumentCaptor<Runnable> retry = ArgumentCaptor.forClass(Runnable.class);
+        verify(threadPool).schedule(retry.capture(), eq(KeyRotationCoordinator.INSTALL_RETRY_INTERVAL), any());
+        canPersist = node -> true;
+        return retry.getValue();
+    }
+
     /** An elected master without the key restores it from its own copy on disk, once per secure settings snapshot. */
     public void testElectedMasterWithoutKeyRestoresItFromItsOwnDisk() {
         ProjectEncryptionKeyMetadata.GatewayKeys keys = new ProjectEncryptionKeyMetadata.GatewayKeys();

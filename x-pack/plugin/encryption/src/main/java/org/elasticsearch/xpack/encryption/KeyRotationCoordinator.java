@@ -58,6 +58,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * Owns the PEK lifecycle on the elected master: installs the initial key, rotates the active key on a timer, updates
@@ -75,6 +76,8 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
     private static final int GRACE_TICKS = 10;
 
     static final TimeValue INSTALL_RETRY_INTERVAL = TimeValue.timeValueSeconds(10);
+    // lets the other nodes finish a cluster-wide secure settings reload before the master asks them again
+    static final TimeValue RELOAD_INSTALL_RETRY_DELAY = TimeValue.timeValueSeconds(1);
 
     /**
      * How frequently the project encryption key is rotated. {@link TimeValue#ZERO} disables rotation.
@@ -150,8 +153,10 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
     private final AtomicBoolean beginRotationInFlight = new AtomicBoolean(false);
     private final AtomicBoolean passwordIdRotateInFlight = new AtomicBoolean(false);
     private final AtomicBoolean installRecheck = new AtomicBoolean(false);
+    // set while an install retry is pending; whichever of the scheduled retry and an early one takes it releases the install
+    private final AtomicReference<Object> pendingInstallRetry = new AtomicReference<>();
     // node names in the last "cannot persist it" warning, so it is logged only when they change
-    private final AtomicReference<Set<String>> loggedNodesWithoutPassword = new AtomicReference<>();
+    private final AtomicReference<Set<String>> nodesWithoutPEKPassword = new AtomicReference<>();
     // one restore attempt per secure settings snapshot while master, since only a reload can make this node's copy readable
     private final AtomicReference<Settings> lastRestoreAttempt = new AtomicReference<>();
 
@@ -221,6 +226,10 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
     void reload() {
         threadPool.generic().execute(() -> {
             if (closed) return;
+            Object retry = pendingInstallRetry.get();
+            if (retry != null) {
+                threadPool.schedule(() -> retryInstall(retry), RELOAD_INSTALL_RETRY_DELAY, threadPool.generic());
+            }
             ClusterState state = clusterService.state();
             if (state.blocks().hasGlobalBlock(GatewayService.STATE_NOT_RECOVERED_BLOCK)
                 || state.nodes().isLocalNodeElectedMaster() == false) {
@@ -265,6 +274,14 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
             }
         }
         if (event.localNodeMaster() == false) {
+            return;
+        }
+        Object retry = pendingInstallRetry.get();
+        if (retry != null
+            && event.nodesChanged()
+            && Stream.concat(event.nodesDelta().addedNodes().stream(), event.nodesDelta().removedNodes().stream())
+                .anyMatch(node -> PasswordPekEncryption.persistsClusterState(node.getRoles(), stateless))) {
+            threadPool.generic().execute(() -> retryInstall(retry));
             return;
         }
         checkPasswordId(state);
@@ -476,21 +493,20 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
         ActionListener<TransportCanPersistKeyAction.Response> listener = ActionListener.wrap(response -> {
             Set<String> ready = response.readyNodeIds();
             if (Arrays.stream(nodes).allMatch(node -> ready.contains(node.getId()))) {
-                loggedNodesWithoutPassword.set(null);
+                nodesWithoutPEKPassword.set(null);
                 submitInstall(passwordId, ready);
                 return;
             }
-            Set<String> withoutPassword = response.getNodes()
+            Set<String> notReady = response.getNodes()
                 .stream()
                 .filter(r -> r.canPersist() == false)
                 .map(r -> r.getNode().getName())
                 .collect(Collectors.toCollection(TreeSet::new));
-            if (withoutPassword.isEmpty() == false
-                && withoutPassword.equals(loggedNodesWithoutPassword.getAndSet(withoutPassword)) == false) {
+            if (notReady.isEmpty() == false && notReady.equals(this.nodesWithoutPEKPassword.getAndSet(notReady)) == false) {
                 logger.warn(
                     "project encryption key not installed yet: nodes {} cannot persist it. Configure [{}] and the matching [{}<id>]"
                         + " secure setting on every master-eligible and data node and reload secure settings",
-                    withoutPassword,
+                    notReady,
                     ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY,
                     ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX
                 );
@@ -506,7 +522,7 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
             logger.warn("failed to check whether every node can persist the project encryption key", e);
             retryInstallLater();
         });
-        // forked off the cluster applier thread, which must not call ClusterService#state() as nodes actions do
+        // forked to avoid calling on the cluster applier thread
         threadPool.generic().execute(ActionRunnable.wrap(listener, l -> {
             try (var ignored = threadPool.getThreadContext().newEmptySystemContext()) {
                 client.execute(TransportCanPersistKeyAction.TYPE, new TransportCanPersistKeyAction.Request(nodes), l);
@@ -538,17 +554,25 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
 
     /**
      * Releases the install and checks again after {@link #INSTALL_RETRY_INTERVAL}. Nodes don't tell the master when they reload secure
-     * settings, so it has to ask again.
+     * settings, so it has to ask again. A secure settings reload on this node, or a node that persists cluster state joining or leaving,
+     * retries earlier.
      */
     private void retryInstallLater() {
+        Object retry = new Object();
+        pendingInstallRetry.set(retry);
         try {
-            threadPool.schedule(() -> {
-                releaseInstall();
-                recheckIfMaster();
-            }, INSTALL_RETRY_INTERVAL, threadPool.generic());
+            threadPool.schedule(() -> retryInstall(retry), INSTALL_RETRY_INTERVAL, threadPool.generic());
         } catch (Exception e) {
+            pendingInstallRetry.set(null);
             releaseInstall();
             logger.debug("could not schedule a project encryption key install retry", e);
+        }
+    }
+
+    private void retryInstall(Object retry) {
+        if (pendingInstallRetry.compareAndSet(retry, null)) {
+            releaseInstall();
+            recheckIfMaster();
         }
     }
 
