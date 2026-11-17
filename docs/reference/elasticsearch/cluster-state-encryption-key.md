@@ -125,6 +125,8 @@ A node that can't decrypt the key on its disk, for example because it restarted 
 * Configure the password that the elected master's copy is wrapped with on the elected master, as `cluster.state.encryption.password.<id>` together with `cluster.state.encryption.active_password_id`, then reload its secure settings. The elected master then reads the key from its disk.
 * If that password is lost, restart the master-eligible nodes so that a node that can read its copy is elected.
 
+As when the key is first created, the elected master restores the key only once every master-eligible and data node has a password configured. Until then, it logs a warning that names the nodes without one.
+
 The elected master logs a warning that says why it can't read its copy. Don't reset the key while another node might still hold it: a reset permanently deletes all encrypted data. To check, send `GET /_health_report/cluster_state_encryption` directly to each node. A node that reports `key_on_disk: true` holds a copy of the key, and `can_read_key_on_disk: true` means it has the password to read that copy.
 
 ## Reset the cluster state encryption key [cluster-state-encryption-key-reset]

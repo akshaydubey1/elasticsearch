@@ -124,8 +124,7 @@ final class ProjectEncryptionKeyPasswordSettings {
                 );
             }
         }
-        if (keyOnDiskPasswordId != null
-            && hasPassword(current, keyOnDiskPasswordId)
+        if (hasPassword(current, keyOnDiskPasswordId)
             && hasPassword(updated, keyOnDiskPasswordId) == false) {
             String missing = PASSWORD_PREFIX + keyOnDiskPasswordId;
             throw new IllegalArgumentException(

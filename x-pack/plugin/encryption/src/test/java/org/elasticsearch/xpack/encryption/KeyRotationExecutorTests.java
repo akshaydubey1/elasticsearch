@@ -299,12 +299,30 @@ public class KeyRotationExecutorTests extends ESTestCase {
             Map.of(),
             NO_OP_ENCRYPTION
         );
-        ClusterState restored = executor.executeTask(new KeyRotationCoordinator.RestoreKeysTask(keys), stateWith(degraded("k1"))).v1();
-        assertSame(keys, metadataOf(restored));
+        var task = new KeyRotationCoordinator.RestoreKeysTask(keys, Set.of());
+        assertSame(keys, metadataOf(executor.executeTask(task, stateWith(degraded("k1"))).v1()));
 
         for (ClusterState state : List.of(stateWith(degraded("k2")), stateWith(null), stateWith(keys))) {
-            assertSame(state, executor.executeTask(new KeyRotationCoordinator.RestoreKeysTask(keys), state).v1());
+            assertSame(state, executor.executeTask(task, state).v1());
         }
+    }
+
+    /** As for the install, the restore goes ahead only if every node that persists cluster state reported it can persist the key. */
+    public void testRestoreRequiresEveryNodeThatPersistsClusterStateToBeReady() {
+        ProjectEncryptionKeyMetadata keys = new ProjectEncryptionKeyMetadata(
+            Map.of("k1", entry(1L)),
+            "k1",
+            PASSWORD_ID,
+            Map.of(),
+            NO_OP_ENCRYPTION
+        );
+        ClusterState state = ClusterState.builder(stateWith(degraded("k1")))
+            .nodes(DiscoveryNodes.builder().add(DiscoveryNodeUtils.create("ready")).add(DiscoveryNodeUtils.create("joined")))
+            .build();
+        assertSame(state, executor.executeTask(new KeyRotationCoordinator.RestoreKeysTask(keys, Set.of("ready")), state).v1());
+        ClusterState restored = executor.executeTask(new KeyRotationCoordinator.RestoreKeysTask(keys, Set.of("ready", "joined")), state)
+            .v1();
+        assertSame(keys, metadataOf(restored));
     }
 
     /** Key-less metadata would turn into metadata holding only a new key, losing the keys other nodes still hold. */
