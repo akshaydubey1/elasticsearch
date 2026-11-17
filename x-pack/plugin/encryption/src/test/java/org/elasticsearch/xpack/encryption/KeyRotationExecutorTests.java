@@ -15,6 +15,7 @@ import org.elasticsearch.cluster.node.DiscoveryNodeRole;
 import org.elasticsearch.cluster.node.DiscoveryNodeUtils;
 import org.elasticsearch.cluster.node.DiscoveryNodes;
 import org.elasticsearch.cluster.project.DefaultProjectResolver;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.Tuple;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.xpack.encryption.ProjectEncryptionKeyMetadata.KeyEntry;
@@ -286,7 +287,16 @@ public class KeyRotationExecutorTests extends ESTestCase {
         assertEquals(keyId, metadataOf(statelessExecutor.executeTask(installTask(keyId, Set.of("master")), state).v1()).getActiveKeyId());
     }
 
-    private static KeyRotationCoordinator.InstallKeyTask installTask(String keyId, Set<String> readyNodeIds) {
+    /** With passwords from cluster secrets no node is checked, since every node gets the same password. */
+    public void testInstallWithoutReadyNodeIdsSkipsTheCheck() {
+        ClusterState state = ClusterState.builder(stateWith(null))
+            .nodes(DiscoveryNodes.builder().add(DiscoveryNodeUtils.create("master")))
+            .build();
+        String keyId = ProjectEncryptionKeyMetadata.generateKeyId();
+        assertEquals(keyId, metadataOf(executor.executeTask(installTask(keyId, null), state).v1()).getActiveKeyId());
+    }
+
+    private static KeyRotationCoordinator.InstallKeyTask installTask(String keyId, @Nullable Set<String> readyNodeIds) {
         return new KeyRotationCoordinator.InstallKeyTask(keyId, randomKey(), PASSWORD_ID, 0L, readyNodeIds);
     }
 

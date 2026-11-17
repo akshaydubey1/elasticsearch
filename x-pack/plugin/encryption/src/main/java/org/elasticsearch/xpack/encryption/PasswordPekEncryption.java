@@ -7,7 +7,9 @@
 package org.elasticsearch.xpack.encryption;
 
 import org.elasticsearch.ElasticsearchException;
+import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.node.DiscoveryNodeRole;
+import org.elasticsearch.common.settings.ClusterSecrets;
 import org.elasticsearch.common.settings.SecureString;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.core.Nullable;
@@ -44,11 +46,19 @@ public final class PasswordPekEncryption implements ProjectEncryptionKeyMetadata
     /**
      * Returns whether a node with {@code roles} persists cluster state, and so must be able to wrap the key. Mirrors
      * {@link org.elasticsearch.gateway.GatewayMetaState}, which gives master-eligible and data nodes an on-disk persisted state. On
-     * stateless only master-eligible nodes persist it, to the object store when elected, and they wrap the key with their own password.
+     * stateless only the elected master persists it, to the object store, so every master-eligible node must be able to.
      */
     static boolean persistsClusterState(Set<DiscoveryNodeRole> roles, boolean stateless) {
         return roles.contains(DiscoveryNodeRole.MASTER_ROLE)
             || (stateless == false && roles.stream().anyMatch(DiscoveryNodeRole::canContainData));
+    }
+
+    /**
+     * Returns whether the passwords come from {@link ClusterSecrets} in cluster state, the same on every node, rather than from each
+     * node's keystore. Then no node can lack the password the others have, so nodes aren't checked.
+     */
+    static boolean passwordsFromClusterSecrets(ClusterState state) {
+        return state.custom(ClusterSecrets.TYPE) != null;
     }
 
     /** Returns whether this node can write the key to its disk. */

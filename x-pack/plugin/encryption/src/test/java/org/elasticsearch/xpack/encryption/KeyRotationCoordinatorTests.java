@@ -27,7 +27,9 @@ import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.cluster.service.MasterServiceTaskQueue;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.common.settings.ClusterSecrets;
 import org.elasticsearch.common.settings.MockSecureSettings;
+import org.elasticsearch.common.settings.SecureClusterStateSettings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
 import org.elasticsearch.common.util.concurrent.ThreadContext;
@@ -282,6 +284,25 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
         );
         verify(taskQueue).submitTask(eq("install-project-encryption-key"), install.capture(), any());
         assertEquals(Set.of("local", "other"), ((KeyRotationCoordinator.InstallKeyTask) install.getValue()).readyNodeIds());
+    }
+
+    /** With passwords from cluster secrets every node has the same password, so the master installs without asking the nodes. */
+    public void testInstallWithoutAskingNodesWhenPasswordsComeFromClusterSecrets() {
+        FeatureService featureService = mock(FeatureService.class);
+        when(featureService.clusterHasFeature(any(), any())).thenReturn(true);
+        ClusterState state = ClusterState.builder(clusterStateWith(null, true))
+            .putCustom(ClusterSecrets.TYPE, new ClusterSecrets(1, SecureClusterStateSettings.EMPTY))
+            .build();
+        setup(state, 0L, TimeValue.timeValueDays(30), TimeValue.timeValueMinutes(1), featureService);
+        canPersist = node -> false;
+
+        coordinator.onClusterStateChanged(new ClusterChangedEvent("test", state, state));
+
+        ArgumentCaptor<KeyRotationCoordinator.KeyRotationTask> install = ArgumentCaptor.forClass(
+            KeyRotationCoordinator.KeyRotationTask.class
+        );
+        verify(taskQueue).submitTask(eq("install-project-encryption-key"), install.capture(), any());
+        assertNull(((KeyRotationCoordinator.InstallKeyTask) install.getValue()).readyNodeIds());
     }
 
     /** A node that persists cluster state restarting, here with a password, ends the wait for the retry. */

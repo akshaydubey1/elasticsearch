@@ -503,9 +503,14 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
 
     /**
      * Calls {@code onReady} with the ids of the nodes that reported they can wrap the key, once every node that persists cluster state
-     * has, and asks again while some can't. One check runs at a time. {@code pending} names what waits for it, for the warning.
+     * has, and asks again while some can't. One check runs at a time. {@code pending} names what waits for it, for the warning. When
+     * every node gets the password from cluster secrets, calls it right away with {@code null}.
      */
     private void whenEveryNodeCanPersist(ClusterState state, String pending, Consumer<Set<String>> onReady) {
+        if (PasswordPekEncryption.passwordsFromClusterSecrets(state)) {
+            onReady.accept(null);
+            return;
+        }
         // If a node joined during the check, the install or restore would be dropped (not all nodes are guaranteed to be able to wrap the
         // PEK), so check again once this one completes. Set before acquiring, so a holder that releases concurrently still sees it.
         persistCheckRecheck.set(true);
@@ -573,7 +578,7 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
         persistCheckRecheck.set(false);
     }
 
-    private void submitInstall(String passwordId, Set<String> readyNodeIds) {
+    private void submitInstall(String passwordId, @Nullable Set<String> readyNodeIds) {
         byte[] plaintextPek = randomKey();
         String keyId = ProjectEncryptionKeyMetadata.generateKeyId();
         logger.debug("submitting install-project-encryption-key task: keyId={}, passwordId={}", keyId, passwordId);
@@ -762,9 +767,9 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
 
     /**
      * Installs the first key, but only if every node that persists cluster state is among {@code readyNodeIds}, the nodes that reported
-     * they can persist the key.
+     * they can persist the key. {@code null} when the passwords come from cluster secrets and no node is checked.
      */
-    record InstallKeyTask(String keyId, byte[] pekBytes, String passwordId, long generatedAt, Set<String> readyNodeIds)
+    record InstallKeyTask(String keyId, byte[] pekBytes, String passwordId, long generatedAt, @Nullable Set<String> readyNodeIds)
         implements
             KeyRotationTask {
         @Override
@@ -782,7 +787,7 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
      * Replaces the key-less metadata an elected master published with the keys it read from its own disk for the same active key, but
      * only if every node that persists cluster state is among {@code readyNodeIds}, as for {@link InstallKeyTask}.
      */
-    record RestoreKeysTask(ProjectEncryptionKeyMetadata keys, Set<String> readyNodeIds) implements KeyRotationTask {
+    record RestoreKeysTask(ProjectEncryptionKeyMetadata keys, @Nullable Set<String> readyNodeIds) implements KeyRotationTask {
         @Override
         public String description() {
             return "project encryption key restore [" + keys.getActiveKeyId() + "]";
@@ -926,14 +931,15 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
             return Tuple.tuple(putMetadata(clusterState, projectState, task.keys()), null);
         }
 
-        private boolean everyNodeThatPersistsIsReady(ClusterState clusterState, Set<String> readyNodeIds) {
-            return clusterState.nodes()
-                .getAllNodes()
-                .stream()
-                .noneMatch(
-                    node -> PasswordPekEncryption.persistsClusterState(node.getRoles(), stateless)
-                        && readyNodeIds.contains(node.getId()) == false
-                );
+        private boolean everyNodeThatPersistsIsReady(ClusterState clusterState, @Nullable Set<String> readyNodeIds) {
+            return readyNodeIds == null
+                || clusterState.nodes()
+                    .getAllNodes()
+                    .stream()
+                    .noneMatch(
+                        node -> PasswordPekEncryption.persistsClusterState(node.getRoles(), stateless)
+                            && readyNodeIds.contains(node.getId()) == false
+                    );
         }
 
         private Tuple<ClusterState, Void> executeBeginRotation(

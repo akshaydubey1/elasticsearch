@@ -170,7 +170,12 @@ public class EncryptionPlugin extends Plugin
     private boolean clusterUsesKey() {
         ProjectEncryptionKeyService service = pekService.get();
         ClusterService localClusterService = clusterService.get();
-        return service != null && localClusterService != null && service.metadataIn(localClusterService.state()) != null;
+        if (service == null || localClusterService == null) {
+            return false;
+        }
+        ClusterState state = localClusterService.state();
+        // cluster secrets are the source of truth, so rejecting their reload would only leave this node out of step with them
+        return PasswordPekEncryption.passwordsFromClusterSecrets(state) == false && service.metadataIn(state) != null;
     }
 
     /**
@@ -187,6 +192,10 @@ public class EncryptionPlugin extends Plugin
             ProjectEncryptionKeyService service = pekService.get();
             // the master also runs join validators, for the joining node, which this node's settings say nothing about
             if (localClusterService == null || service == null || node.getId().equals(localClusterService.localNode().getId()) == false) {
+                return;
+            }
+            // the node gets the password from cluster secrets once it joins, whatever it loaded at startup
+            if (PasswordPekEncryption.passwordsFromClusterSecrets(state)) {
                 return;
             }
             ProjectEncryptionKeyMetadata metadata = service.metadataIn(state);
