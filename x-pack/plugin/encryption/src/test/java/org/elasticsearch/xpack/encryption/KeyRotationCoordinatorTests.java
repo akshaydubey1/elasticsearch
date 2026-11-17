@@ -27,9 +27,7 @@ import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.cluster.service.MasterServiceTaskQueue;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
-import org.elasticsearch.common.settings.ClusterSecrets;
 import org.elasticsearch.common.settings.MockSecureSettings;
-import org.elasticsearch.common.settings.SecureClusterStateSettings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
 import org.elasticsearch.common.util.concurrent.ThreadContext;
@@ -129,6 +127,7 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
     private AtomicReference<Settings> settingsRef;
     private ThreadPool threadPool;
     private Predicate<DiscoveryNode> canPersist = node -> true;
+    private Settings nodeSettings = Settings.EMPTY;
 
     /** Answers the readiness check from {@link #canPersist}, as the nodes would over transport. */
     @SuppressWarnings("unchecked")
@@ -162,7 +161,7 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
         taskQueue = mock(MasterServiceTaskQueue.class);
         ClusterService clusterService = mock(ClusterService.class);
         when(clusterService.state()).thenReturn(state);
-        when(clusterService.getSettings()).thenReturn(Settings.EMPTY);
+        when(clusterService.getSettings()).thenReturn(nodeSettings);
         MasterServiceTaskQueue rawQueue = taskQueue;
         when(clusterService.createTaskQueue(anyString(), any(), any())).thenReturn(rawQueue);
         threadPool = mock(ThreadPool.class);
@@ -274,6 +273,7 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
             )
         );
         verify(taskQueue, never()).submitTask(anyString(), any(), any());
+        assertEquals("reported by the health indicator", Set.of("other"), coordinator.nodesWithoutPassword());
         ArgumentCaptor<Runnable> retry = ArgumentCaptor.forClass(Runnable.class);
         verify(threadPool).schedule(retry.capture(), eq(KeyRotationCoordinator.PERSIST_CHECK_RETRY_INTERVAL), any());
 
@@ -284,16 +284,13 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
         );
         verify(taskQueue).submitTask(eq("install-project-encryption-key"), install.capture(), any());
         assertEquals(Set.of("local", "other"), ((KeyRotationCoordinator.InstallKeyTask) install.getValue()).readyNodeIds());
+        assertEquals(Set.of(), coordinator.nodesWithoutPassword());
     }
 
-    /** With passwords from cluster secrets every node has the same password, so the master installs without asking the nodes. */
-    public void testInstallWithoutAskingNodesWhenPasswordsComeFromClusterSecrets() {
-        FeatureService featureService = mock(FeatureService.class);
-        when(featureService.clusterHasFeature(any(), any())).thenReturn(true);
-        ClusterState state = ClusterState.builder(clusterStateWith(null, true))
-            .putCustom(ClusterSecrets.TYPE, new ClusterSecrets(1, SecureClusterStateSettings.EMPTY))
-            .build();
-        setup(state, 0L, TimeValue.timeValueDays(30), TimeValue.timeValueMinutes(1), featureService);
+    /** On stateless with passwords from cluster secrets every node has the same password, so the master installs without asking. */
+    public void testInstallWithoutAskingNodesWhenPasswordsComeFromClusterSecretsOnStateless() throws IOException {
+        nodeSettings = Settings.builder().put(DiscoveryNode.STATELESS_ENABLED_SETTING_NAME, true).build();
+        ClusterState state = clusterStateWithPasswordInClusterSecrets();
         canPersist = node -> false;
 
         coordinator.onClusterStateChanged(new ClusterChangedEvent("test", state, state));
@@ -303,6 +300,28 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
         );
         verify(taskQueue).submitTask(eq("install-project-encryption-key"), install.capture(), any());
         assertNull(((KeyRotationCoordinator.InstallKeyTask) install.getValue()).readyNodeIds());
+    }
+
+    /** On stateful a node persists a cluster state before its cluster secrets reach it, so nodes are still asked. */
+    public void testStatefulAsksNodesEvenWhenPasswordsComeFromClusterSecrets() throws IOException {
+        ClusterState state = clusterStateWithPasswordInClusterSecrets();
+        canPersist = node -> false;
+
+        coordinator.onClusterStateChanged(new ClusterChangedEvent("test", state, state));
+
+        verify(taskQueue, never()).submitTask(anyString(), any(), any());
+        verify(threadPool).schedule(any(), eq(KeyRotationCoordinator.PERSIST_CHECK_RETRY_INTERVAL), any());
+    }
+
+    private ClusterState clusterStateWithPasswordInClusterSecrets() throws IOException {
+        FeatureService featureService = mock(FeatureService.class);
+        when(featureService.clusterHasFeature(any(), any())).thenReturn(true);
+        ClusterState state = PasswordPekEncryptionTests.withClusterSecrets(
+            clusterStateWith(null, true),
+            ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY
+        );
+        setup(state, 0L, TimeValue.timeValueDays(30), TimeValue.timeValueMinutes(1), featureService);
+        return state;
     }
 
     /** A node that persists cluster state restarting, here with a password, ends the wait for the retry. */
@@ -484,7 +503,10 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
         when(featureService.clusterHasFeature(any(), any())).thenReturn(true);
         MockSecureSettings secure = new MockSecureSettings();
         secure.setString(ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY, "v2");
-        secure.setString(ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX + PASSWORD_ID, PASSWORD_VALUE);
+        // not needed, e.g. cluster secrets may switch to the new password and drop the old one in one step
+        if (randomBoolean()) {
+            secure.setString(ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX + PASSWORD_ID, PASSWORD_VALUE);
+        }
         secure.setString(ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX + "v2", "new-password-fips");
 
         ProjectEncryptionKeyMetadata existing = new ProjectEncryptionKeyMetadata(

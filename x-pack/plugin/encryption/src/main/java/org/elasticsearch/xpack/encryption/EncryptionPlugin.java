@@ -64,16 +64,15 @@ public class EncryptionPlugin extends Plugin
     private final SetOnce<ProjectEncryptionKeyService> pekService = new SetOnce<>();
     private final SetOnce<ClusterService> clusterService = new SetOnce<>();
 
+    private final boolean stateless;
     private final boolean persistsClusterState;
     private volatile Settings pekSettings;
 
     private final PasswordPekEncryption pekEncryption = new PasswordPekEncryption(() -> this.pekSettings);
 
     public EncryptionPlugin(Settings settings) {
-        this.persistsClusterState = PasswordPekEncryption.persistsClusterState(
-            DiscoveryNode.getRolesFromSettings(settings),
-            DiscoveryNode.isStateless(settings)
-        );
+        this.stateless = DiscoveryNode.isStateless(settings);
+        this.persistsClusterState = PasswordPekEncryption.persistsClusterState(DiscoveryNode.getRolesFromSettings(settings), stateless);
         this.pekSettings = ProjectEncryptionKeyPasswordSettings.cloneSettings(settings);
         // Clear any service left in the registry by a previously constructed plugin instance (e.g. a prior node in the same test JVM),
         // so this node's createComponents publishes into a clean slot.
@@ -120,7 +119,8 @@ public class EncryptionPlugin extends Plugin
             services.projectResolver(),
             pekService,
             pekEncryption,
-            handlerRegistry
+            handlerRegistry,
+            coordinator::nodesWithoutPassword
         );
 
         this.coordinator.set(coordinator);
@@ -175,7 +175,7 @@ public class EncryptionPlugin extends Plugin
         }
         ClusterState state = localClusterService.state();
         // cluster secrets are the source of truth, so rejecting their reload would only leave this node out of step with them
-        return PasswordPekEncryption.passwordsFromClusterSecrets(state) == false && service.metadataIn(state) != null;
+        return PasswordPekEncryption.passwordsFromClusterSecrets(state, stateless) == false && service.metadataIn(state) != null;
     }
 
     /**
@@ -195,7 +195,7 @@ public class EncryptionPlugin extends Plugin
                 return;
             }
             // the node gets the password from cluster secrets once it joins, whatever it loaded at startup
-            if (PasswordPekEncryption.passwordsFromClusterSecrets(state)) {
+            if (PasswordPekEncryption.passwordsFromClusterSecrets(state, stateless)) {
                 return;
             }
             ProjectEncryptionKeyMetadata metadata = service.metadataIn(state);

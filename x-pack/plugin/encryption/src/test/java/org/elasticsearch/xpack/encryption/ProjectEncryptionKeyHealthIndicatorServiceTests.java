@@ -26,6 +26,8 @@ import org.elasticsearch.xpack.encryption.spi.EncryptionServiceState;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.UnaryOperator;
 
@@ -100,12 +102,61 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
         PasswordPekEncryption pekEncryption,
         List<EncryptedDataHandler<?>> handlers
     ) {
+        return indicator(state, pekService, pekEncryption, handlers, Set.of());
+    }
+
+    private static ProjectEncryptionKeyHealthIndicatorService indicator(
+        ClusterState state,
+        ProjectEncryptionKeyService pekService,
+        PasswordPekEncryption pekEncryption,
+        List<EncryptedDataHandler<?>> handlers,
+        Set<String> nodesWithoutPassword
+    ) {
         return new ProjectEncryptionKeyHealthIndicatorService(
             mockClusterService(state),
             DefaultProjectResolver.INSTANCE,
             pekService,
             pekEncryption,
-            new EncryptedDataHandlerRegistry(handlers)
+            new EncryptedDataHandlerRegistry(handlers),
+            () -> nodesWithoutPassword
+        );
+    }
+
+    /** On the elected master, an install waiting for nodes without a password is YELLOW and names them. */
+    public void testYellowWhileInstallWaitsForNodesWithoutPassword() {
+        ProjectEncryptionKeyHealthIndicatorService indicator = indicator(
+            stateWith(null),
+            mockPekService(EncryptionServiceState.READY, PASSWORD_ID),
+            new PasswordPekEncryption(() -> PASSWORD_SETTINGS),
+            List.of(),
+            Set.of("node-b", "node-a")
+        );
+
+        HealthIndicatorResult result = indicator.calculate(true, 1, HealthInfo.EMPTY_HEALTH_INFO);
+        assertEquals(HealthStatus.YELLOW, result.status());
+        assertEquals(ProjectEncryptionKeyHealthIndicatorService.YELLOW_WAITING_FOR_NODES, result.symptom());
+        assertEquals(
+            ProjectEncryptionKeyHealthIndicatorService.NODES_WITHOUT_PASSWORD_DEFINITION,
+            result.diagnosisList().get(0).definition()
+        );
+        assertEquals(new TreeSet<>(Set.of("node-a", "node-b")), detailsMap(result).get("nodes_without_password"));
+    }
+
+    /** A restore waiting for nodes without a password says so instead of how to give the master its password. */
+    public void testRestoreWaitingForNodesWithoutPasswordNamesThem() {
+        ProjectEncryptionKeyHealthIndicatorService indicator = indicator(
+            stateWith(ProjectEncryptionKeyMetadata.degraded("k1", PASSWORD_ID, NO_OP_ENCRYPTION, "no key")),
+            mockPekService(EncryptionServiceState.UNAVAILABLE_DECRYPTION_FAILED, PASSWORD_ID),
+            new PasswordPekEncryption(() -> PASSWORD_SETTINGS),
+            List.of(),
+            Set.of("node-b")
+        );
+
+        HealthIndicatorResult result = indicator.calculate(true, 1, HealthInfo.EMPTY_HEALTH_INFO);
+        assertEquals(ProjectEncryptionKeyHealthIndicatorService.MASTER_HAS_NO_KEY, result.symptom());
+        assertEquals(
+            ProjectEncryptionKeyHealthIndicatorService.NODES_WITHOUT_PASSWORD_DEFINITION,
+            result.diagnosisList().get(0).definition()
         );
     }
 
@@ -287,6 +338,17 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
         details = detailsMap(indicator.calculate(true, 1, HealthInfo.EMPTY_HEALTH_INFO));
         assertEquals(true, details.get("key_on_disk"));
         assertEquals(true, details.get("can_read_key_on_disk"));
+        assertEquals(PASSWORD_ID, details.get("key_on_disk_password_id"));
+
+        MockSecureSettings wrongPassword = new MockSecureSettings();
+        wrongPassword.setString(ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY, PASSWORD_ID);
+        wrongPassword.setString(ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX + PASSWORD_ID, "another-password-fips");
+        settings.set(Settings.builder().setSecureSettings(wrongPassword).build());
+        assertEquals(
+            "a password with the same id that doesn't decrypt the copy",
+            false,
+            detailsMap(indicator.calculate(true, 1, HealthInfo.EMPTY_HEALTH_INFO)).get("can_read_key_on_disk")
+        );
 
         settings.set(Settings.EMPTY);
         assertEquals(false, detailsMap(indicator.calculate(true, 1, HealthInfo.EMPTY_HEALTH_INFO)).get("can_read_key_on_disk"));

@@ -7,6 +7,10 @@
 package org.elasticsearch.xpack.encryption;
 
 import org.apache.logging.log4j.core.LogEvent;
+import org.elasticsearch.action.admin.cluster.configuration.AddVotingConfigExclusionsRequest;
+import org.elasticsearch.action.admin.cluster.configuration.ClearVotingConfigExclusionsRequest;
+import org.elasticsearch.action.admin.cluster.configuration.TransportAddVotingConfigExclusionsAction;
+import org.elasticsearch.action.admin.cluster.configuration.TransportClearVotingConfigExclusionsAction;
 import org.elasticsearch.cluster.coordination.JoinHelper;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.settings.MockSecureSettings;
@@ -16,6 +20,7 @@ import org.elasticsearch.health.HealthStatus;
 import org.elasticsearch.health.node.HealthInfo;
 import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.plugins.PluginsService;
+import org.elasticsearch.reservedstate.service.FileSettingsService;
 import org.elasticsearch.test.ESIntegTestCase;
 import org.elasticsearch.test.MockLog;
 import org.elasticsearch.test.NodeRoles;
@@ -23,6 +28,7 @@ import org.elasticsearch.xpack.encryption.spi.EncryptedData;
 import org.elasticsearch.xpack.encryption.spi.EncryptionService;
 import org.elasticsearch.xpack.encryption.spi.EncryptionServiceState;
 import org.elasticsearch.xpack.encryption.spi.EncryptionServiceUnavailableException;
+import org.elasticsearch.xpack.stateless.settings.secure.SecureSettingsPlugin;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -32,6 +38,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
 
@@ -54,6 +61,7 @@ public class ProjectEncryptionKeyMissingPasswordIT extends ESIntegTestCase {
     protected Collection<Class<? extends Plugin>> nodePlugins() {
         Collection<Class<? extends Plugin>> plugins = new ArrayList<>(super.nodePlugins());
         plugins.add(EncryptionPlugin.class);
+        plugins.add(SecureSettingsPlugin.class);
         return plugins;
     }
 
@@ -88,6 +96,42 @@ public class ProjectEncryptionKeyMissingPasswordIT extends ESIntegTestCase {
     }
 
     /**
+     * On stateful a node persists a cluster state before it applies the cluster secrets in it, so a node without the password in its
+     * keystore is rejected at join even when the cluster secrets hold the password.
+     */
+    public void testNodeWithoutPasswordCannotJoinStatefulClusterWithPasswordInClusterSecrets() throws Exception {
+        internalCluster().setBootstrapMasterNodeIndex(0);
+        String master = internalCluster().startNode();
+        reload(master, passwordSettings());
+        assertBusy(() -> assertThat(pekOn(master), notNullValue()));
+
+        FileSettingsService fileSettings = internalCluster().getInstance(FileSettingsService.class, master);
+        assertBusy(() -> assertTrue(fileSettings.watching()));
+        CountDownLatch applied = KeyRotationViaClusterSecretsIT.fileSettingsAppliedLatch(master, 1);
+        KeyRotationViaClusterSecretsIT.writeFileSettingsJson(
+            master,
+            KeyRotationViaClusterSecretsIT.clusterSecretsJson(
+                1,
+                ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY,
+                PASSWORD_ID,
+                ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX + PASSWORD_ID,
+                PASSWORD
+            )
+        );
+        assertTrue("file-settings update was not applied within 30s", applied.await(30, TimeUnit.SECONDS));
+
+        String joining;
+        try (MockLog mockLog = MockLog.capture(JoinHelper.class)) {
+            mockLog.addExpectation(new JoinRejectedExpectation());
+            joining = internalCluster().startNode(NodeRoles.dataOnlyNode());
+            mockLog.awaitAllExpectationsMatched();
+        }
+        assertEquals(1, internalCluster().clusterService(master).state().nodes().size());
+        // stopped because the test framework's teardown would otherwise use a node that has no master
+        internalCluster().stopNode(joining);
+    }
+
+    /**
      * The master restarts without its password. Encryption is unavailable until its password is reloaded; it then reads the key from its
      * disk.
      */
@@ -111,6 +155,45 @@ public class ProjectEncryptionKeyMissingPasswordIT extends ESIntegTestCase {
         reload(master, passwordSettings());
         assertBusy(() -> assertFalse(pekOn(master).isUnwrapFailed()));
         assertArrayEquals(payload, decryptOn(master, encrypted));
+    }
+
+    /**
+     * The elected master lost the password its copy is wrapped with. Failing over to a node that can read its own copy restores the key,
+     * once every node can persist it.
+     */
+    public void testFailoverToNodeThatCanReadItsCopyRestoresTheKey() throws Exception {
+        internalCluster().setBootstrapMasterNodeIndex(0);
+        List<String> nodes = internalCluster().startNodes(2);
+        ensureStableCluster(2);
+        for (String node : nodes) {
+            reload(node, passwordSettings());
+        }
+        assertBusy(() -> nodes.forEach(node -> assertThat(pekOn(node), notNullValue())), 30, TimeUnit.SECONDS);
+        byte[] payload = "failover-payload".getBytes(StandardCharsets.UTF_8);
+        EncryptedData encrypted = internalCluster().getInstance(EncryptionService.class, nodes.get(0)).encrypt(payload);
+
+        internalCluster().fullRestart();
+        ensureStableCluster(2);
+        String master = internalCluster().getMasterName();
+        String other = nodes.stream().filter(node -> node.equals(master) == false).findFirst().orElseThrow();
+        reload(other, passwordSettings());
+        MockSecureSettings newPassword = new MockSecureSettings();
+        newPassword.setString(ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY, "v2");
+        newPassword.setString(ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX + "v2", "encryption-test-password-v2");
+        reload(master, Settings.builder().setSecureSettings(newPassword).build());
+        assertTrue("the master can't read its copy with a different password", pekOn(master).isUnwrapFailed());
+
+        client().execute(TransportAddVotingConfigExclusionsAction.TYPE, new AddVotingConfigExclusionsRequest(TEST_REQUEST_TIMEOUT, master))
+            .get();
+        assertBusy(() -> {
+            assertThat(internalCluster().getMasterName(), equalTo(other));
+            assertFalse(pekOn(other).isUnwrapFailed());
+        }, 30, TimeUnit.SECONDS);
+        assertArrayEquals(payload, decryptOn(master, encrypted));
+        ClearVotingConfigExclusionsRequest clear = new ClearVotingConfigExclusionsRequest(TEST_REQUEST_TIMEOUT);
+        // the former master stays in the cluster
+        clear.setWaitForRemoval(false);
+        client().execute(TransportClearVotingConfigExclusionsAction.TYPE, clear).get();
     }
 
     /** No node can read the key: the cluster still forms, so that a reset can recover it. */

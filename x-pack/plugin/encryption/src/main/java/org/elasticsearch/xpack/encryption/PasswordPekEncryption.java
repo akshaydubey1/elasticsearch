@@ -54,11 +54,16 @@ public final class PasswordPekEncryption implements ProjectEncryptionKeyMetadata
     }
 
     /**
-     * Returns whether the passwords come from {@link ClusterSecrets} in cluster state, the same on every node, rather than from each
-     * node's keystore. Then no node can lack the password the others have, so nodes aren't checked.
+     * Returns whether nodes needn't be checked for the password, because on stateless it comes from {@link ClusterSecrets} in cluster
+     * state, the same on every node. Cluster secrets without the active password id don't count: their reload would remove a password
+     * from the keystore, which the checks must still catch. Stateful nodes are always checked: a node persists a cluster state before
+     * applying it, so it writes the key with the password it had before the cluster secrets in that state reach it.
      */
-    static boolean passwordsFromClusterSecrets(ClusterState state) {
-        return state.custom(ClusterSecrets.TYPE) != null;
+    static boolean passwordsFromClusterSecrets(ClusterState state, boolean stateless) {
+        ClusterSecrets secrets = state.custom(ClusterSecrets.TYPE);
+        return stateless
+            && secrets != null
+            && secrets.getSettings().getSettingNames().contains(ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY);
     }
 
     /** Returns whether this node can write the key to its disk. */
@@ -78,10 +83,10 @@ public final class PasswordPekEncryption implements ProjectEncryptionKeyMetadata
         return check.failure();
     }
 
-    /** Returns whether this node has the password its on-disk copy of the key is wrapped with, so it can read the copy. */
-    boolean canReadKeyOnDisk() {
-        String passwordId = gatewayKeys.passwordId();
-        return passwordId != null && ProjectEncryptionKeyPasswordSettings.hasPassword(settingsSupplier.get(), passwordId);
+    /** Returns whether this node can decrypt its on-disk copy of the key with its passwords, or {@code null} if it holds no copy. */
+    @Nullable
+    Boolean canReadKeyOnDisk() {
+        return gatewayKeys.canRead(this, settingsSupplier.get());
     }
 
     @Override

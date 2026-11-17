@@ -276,6 +276,7 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
         reEncrypting.set(false);
         lastRestoreAttempt.set(null);
         keysReadFromDisk.set(null);
+        nodesWithoutPEKPassword.set(null);
         stopSchedule();
     }
 
@@ -323,6 +324,8 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
             scheduleRestore(metadata, state);
             return;
         }
+        keysReadFromDisk.set(null);
+        nodesWithoutPEKPassword.set(null);
         if (activePasswordId != null && activePasswordId.equals(metadata.getPasswordId()) == false) {
             schedulePasswordIdChange(metadata, activePasswordId);
         }
@@ -478,6 +481,15 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
         return true;
     }
 
+    /**
+     * Returns the names of the nodes that the elected master last found unable to persist the key while an install or restore waits
+     * for them. Empty on other nodes, and once the key is installed or restored.
+     */
+    Set<String> nodesWithoutPassword() {
+        Set<String> nodes = nodesWithoutPEKPassword.get();
+        return nodes == null ? Set.of() : nodes;
+    }
+
     // Visible for testing
     void register(EncryptedDataHandler<?> handler) {
         handlers.add(handler);
@@ -507,7 +519,7 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
      * every node gets the password from cluster secrets, calls it right away with {@code null}.
      */
     private void whenEveryNodeCanPersist(ClusterState state, String pending, Consumer<Set<String>> onReady) {
-        if (PasswordPekEncryption.passwordsFromClusterSecrets(state)) {
+        if (PasswordPekEncryption.passwordsFromClusterSecrets(state, stateless)) {
             onReady.accept(null);
             return;
         }
@@ -530,6 +542,9 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
                 nodesWithoutPEKPassword.set(null);
                 try {
                     onReady.accept(ready);
+                } catch (Exception e) {
+                    // not rethrown: the failure handler would schedule a retry that releases a check another call may hold by then
+                    logger.warn(() -> "failed to submit the project encryption key task once every node could persist it", e);
                 } finally {
                     persistCheckInFlight.set(false);
                 }
@@ -673,8 +688,9 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
                     () -> Strings.format(
                         "the elected master holds no project encryption key [%s] and cannot read it from its disk, so cluster state"
                             + " encryption is unavailable. Configure the password the key on its disk is wrapped with and reload secure"
-                            + " settings, or restart the master-eligible nodes so that a node that can read its copy is elected. If no"
-                            + " node can, call POST /_encryption/_reset?accept_data_loss=true, which deletes all encrypted data",
+                            + " settings, or fail the master over to a master-eligible node that can read its copy, for example by"
+                            + " excluding this node from the voting configuration. If no node can, call"
+                            + " POST /_encryption/_reset?accept_data_loss=true, which deletes all encrypted data",
                         activeKeyId
                     ),
                     e
@@ -728,14 +744,7 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
     private void submitPasswordIdChange(ProjectEncryptionKeyMetadata metadata, String newPasswordId) {
         String oldPasswordId = metadata.getPasswordId();
         Settings settings = this.settingsSupplier.get();
-        if (ProjectEncryptionKeyPasswordSettings.hasPassword(settings, oldPasswordId) == false) {
-            logger.warn(
-                "password id update aborted: previous password [{}{}] is not configured",
-                ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX,
-                oldPasswordId
-            );
-            return;
-        }
+        // the old password isn't needed: the keys are held in plaintext, and this node already wraps them with the new one
         if (ProjectEncryptionKeyPasswordSettings.hasPassword(settings, newPasswordId) == false) {
             logger.warn(
                 "password id update aborted: new password [{}{}] is not configured",

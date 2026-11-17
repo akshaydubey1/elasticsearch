@@ -17,6 +17,7 @@ import org.elasticsearch.common.UUIDs;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.io.stream.Writeable;
+import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.core.FixForMultiProject;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.Tuple;
@@ -159,12 +160,15 @@ class ProjectEncryptionKeyMetadata extends AbstractNamedDiffable<Metadata.Projec
 
     /**
      * The wrapped keys in the cluster state this node last read from or wrote to its disk. While the elected master holds no key, this
-     * node keeps writing this copy instead of erasing it, and hands the key to the master on request.
+     * node keeps writing this copy instead of erasing it, so that a master that can read it can restore the key.
      */
     @FixForMultiProject(description = "one copy per node; with multiple projects each project's copy overwrites the others")
     static final class GatewayKeys {
+        private record ReadCheck(GatewayCopy copy, Settings settings, boolean readable) {}
+
         private GatewayCopy copy;
         private boolean known;
+        private volatile ReadCheck readCheck;
 
         synchronized void set(@Nullable GatewayCopy copy) {
             this.copy = copy;
@@ -189,6 +193,36 @@ class ProjectEncryptionKeyMetadata extends AbstractNamedDiffable<Metadata.Projec
         @Nullable
         synchronized String passwordId() {
             return copy == null ? null : copy.passwordId();
+        }
+
+        /**
+         * Returns whether {@code pekEncryption} can unwrap this node's copy of the active key with the passwords in {@code settings}, or
+         * {@code null} if this node holds no copy. Unwraps at most once per copy and secure settings snapshot, outside the lock, since
+         * health reports call it.
+         */
+        @Nullable
+        Boolean canRead(PekEncryption pekEncryption, Settings settings) {
+            GatewayCopy current;
+            synchronized (this) {
+                current = copy;
+            }
+            if (current == null) {
+                return null;
+            }
+            ReadCheck check = readCheck;
+            if (check == null || check.copy() != current || check.settings() != settings) {
+                boolean readable;
+                try {
+                    byte[] key = pekEncryption.unwrap(current.wrappedKeys().get(current.activeKeyId()).bytes(), current.passwordId());
+                    Arrays.fill(key, (byte) 0);
+                    readable = true;
+                } catch (RuntimeException e) {
+                    readable = false;
+                }
+                check = new ReadCheck(current, settings, readable);
+                readCheck = check;
+            }
+            return check.readable();
         }
 
         /** Returns this node's copy if it is for {@code activeKeyId}, otherwise {@code null}. */

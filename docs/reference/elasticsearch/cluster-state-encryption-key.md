@@ -41,9 +41,9 @@ These settings are node-local. Configure a different password value on each node
 
 Every master-eligible and data node needs a password. These nodes write cluster state to disk, and a node that can't persist the key can't persist cluster state at all. Other nodes, such as dedicated coordinating nodes, don't need one:
 
-* {{es}} creates the cluster state encryption key only once every master-eligible and data node has a password configured. Until then, the elected master logs a warning that names the nodes without one, and checks again periodically.
+* {{es}} creates the cluster state encryption key only once every master-eligible and data node has a password configured. Until then, the elected master logs a warning that names the nodes without one, reports them in its health report, and checks again periodically.
 * Once the key exists, a node without a password can't join the cluster. It logs `this node cannot join the cluster: the cluster uses a cluster state encryption key and this node cannot persist it` and keeps retrying. Configure the password in its keystore and restart it, or reload its secure settings.
-* {{es}} rejects a secure settings reload that would remove the password from a node while the cluster uses the key. It also rejects a reload that removes the password the node's on-disk copy of the key is wrapped with. When you rotate the password, keep the old one until the node has persisted cluster state with the new one.
+* {{es}} rejects a secure settings reload that would remove the password from a node while the cluster uses the key. It also rejects a reload that removes the password the node's on-disk copy of the key is wrapped with. The node keeps using its previous settings only until it restarts: the keystore file has already changed, so after a restart the node can't join the cluster until you configure the password again. When you rotate the password, keep the old one until the node has rewrapped its copy of the key with the new one.
 * A password that's configured but can't be used, such as one shorter than 14 characters in FIPS mode, counts as missing.
 
 **On {{ech}} and {{ece}}**, the control plane supplies this password automatically.
@@ -70,7 +70,9 @@ You don't need to configure an encryption password to upgrade an existing deploy
 
 ### Rotate the encryption password [cluster-state-encryption-password-rotation]
 
-You can rotate each node's password independently without restarting {{es}}. The following procedure rotates the password on one node. Repeat it for any other nodes whose passwords you want to rotate. Keep a node's old password available until that node has loaded the new password and rewrapped its on-disk copy of the cluster state encryption key.
+You can rotate each node's password independently without restarting {{es}}. The following procedure rotates the password on one node. Repeat it for any other nodes whose passwords you want to rotate. Keep a node's old password available until that node has rewrapped its on-disk copy of the cluster state encryption key with the new password.
+
+A node rewraps its copy the next time it writes changed cluster metadata to disk. A change to the elected master's active password ID, or the next automatic key rotation, always causes this on every node. If you rotate the passwords on several nodes, rotate the elected master last, so that its change rewraps the copies on the other nodes too.
 
 1. Add the new password to the node's local {{es}} keystore. For example, to use the password ID `v2`:
 
@@ -96,9 +98,9 @@ You can rotate each node's password independently without restarting {{es}}. The
    GET /_health_report/cluster_state_encryption
    ```
 
-   Before proceeding, verify that the node reports a green status and that both `active_password_id` and `metadata_password_id` are `v2`.
+   Before proceeding, verify that the node reports `active_password_id` and `key_on_disk_password_id` as `v2`. `key_on_disk_password_id` is the password the node's own copy of the key is wrapped with. It changes only once the node rewraps its copy, as described above. `metadata_password_id` is the elected master's active password ID, not this node's.
 
-5. Remove the old password from the node's keystore, then reload the secure settings on that node again.
+5. Remove the old password from the node's keystore, then reload the secure settings on that node again. {{es}} rejects this reload while the node's copy of the key is still wrapped with the old password.
 
 ## Automatic key rotation [cluster-state-encryption-key-rotation]
 
@@ -115,19 +117,21 @@ You can rotate each node's password independently without restarting {{es}}. The
 The `cluster_state_encryption` health indicator reports on the status of the cluster state encryption:
 
 * **Green**: encryption is either working normally, or hasn't been configured (which is expected on most self-managed clusters that haven't set a password).
-* **Yellow**: a password is missing where one is required, a node can't persist the key to disk, or the elected master holds no key and nothing is encrypted yet.
+* **Yellow**: a password is missing where one is required, a node can't persist the key to disk, the elected master is waiting for nodes without a password before it creates the key, or the elected master holds no key and nothing is encrypted yet.
 * **Red**: the elected master holds no key and encrypted secrets are stored. They can't be decrypted until the key is back.
+
+The health report is calculated by the node that receives the request. Only the elected master knows which nodes it's waiting for: send the request to the elected master to see them in `nodes_without_password`.
 
 ### If the elected master holds no key [cluster-state-encryption-master-without-key]
 
 A node that can't decrypt the key on its disk, for example because it restarted without its password, still starts. If it's elected master, encryption is unavailable on every node until it has the key again. Every node keeps its copy of the key on disk in the meantime. To recover:
 
 * Configure the password that the elected master's copy is wrapped with on the elected master, as `cluster.state.encryption.password.<id>` together with `cluster.state.encryption.active_password_id`, then reload its secure settings. The elected master then reads the key from its disk.
-* If that password is lost, restart the master-eligible nodes so that a node that can read its copy is elected.
+* If that password is lost, fail the master over to a master-eligible node that can read its copy. For example, exclude the elected master from the voting configuration with `POST /_cluster/voting_config_exclusions?node_names=<node_name>`, which makes another master-eligible node take over. The new master reads the key from its own copy. Once the key is restored, remove the exclusion with `DELETE /_cluster/voting_config_exclusions?wait_for_removal=false`, since the former master stays in the cluster.
 
-As when the key is first created, the elected master restores the key only once every master-eligible and data node has a password configured. Until then, it logs a warning that names the nodes without one.
+As when the key is first created, the elected master restores the key only once every master-eligible and data node has a password configured. Until then, it logs a warning that names the nodes without one and reports them in `nodes_without_password`.
 
-The elected master logs a warning that says why it can't read its copy. Don't reset the key while another node might still hold it: a reset permanently deletes all encrypted data. To check, send `GET /_health_report/cluster_state_encryption` directly to each node. A node that reports `key_on_disk: true` holds a copy of the key, and `can_read_key_on_disk: true` means it has the password to read that copy.
+The elected master logs a warning that says why it can't read its copy. Don't reset the key while another node might still hold it: a reset permanently deletes all encrypted data. To check, send `GET /_health_report/cluster_state_encryption` directly to each node. A node that reports `key_on_disk: true` holds a copy of the key, and `can_read_key_on_disk: true` means it can decrypt that copy with its current passwords.
 
 ## Reset the cluster state encryption key [cluster-state-encryption-key-reset]
 
