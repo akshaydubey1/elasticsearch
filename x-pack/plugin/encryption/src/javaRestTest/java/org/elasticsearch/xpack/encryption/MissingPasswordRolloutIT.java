@@ -10,6 +10,9 @@ package org.elasticsearch.xpack.encryption;
 import org.apache.http.HttpHost;
 import org.elasticsearch.client.Request;
 import org.elasticsearch.client.RestClient;
+import org.elasticsearch.common.settings.SecureString;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.util.concurrent.ThreadContext;
 import org.elasticsearch.test.cluster.ElasticsearchCluster;
 import org.elasticsearch.test.cluster.MutableSettingsProvider;
 import org.elasticsearch.test.rest.ESRestTestCase;
@@ -38,8 +41,11 @@ public class MissingPasswordRolloutIT extends ESRestTestCase {
     @ClassRule
     public static ElasticsearchCluster cluster = ElasticsearchCluster.local()
         .module("x-pack-encryption")
+        .module("x-pack-security")
         .nodes(NODES)
-        .setting("xpack.security.enabled", "false")
+        // so that the readiness check, an internal action sent to every node, runs under security
+        .setting("xpack.security.enabled", "true")
+        .user("test-admin", "x-pack-test-password")
         .node(0, n -> n.keystore(ACTIVE_PASSWORD_ID, "v1").keystore(PASSWORD, "encryption-test-password"))
         .node(1, n -> n.keystore(ACTIVE_PASSWORD_ID, "v1").keystore(PASSWORD, "encryption-test-password"))
         .node(NODE_WITHOUT_PASSWORD, n -> n.keystore(keystoreOfNodeWithoutPassword))
@@ -48,6 +54,12 @@ public class MissingPasswordRolloutIT extends ESRestTestCase {
     @Override
     protected String getTestRestCluster() {
         return cluster.getHttpAddresses();
+    }
+
+    @Override
+    protected Settings restClientSettings() {
+        String token = basicAuthHeaderValue("test-admin", new SecureString("x-pack-test-password".toCharArray()));
+        return Settings.builder().put(ThreadContext.PREFIX + ".Authorization", token).build();
     }
 
     public void testKeyIsInstalledOnceTheLastNodeHasItsPassword() throws Exception {

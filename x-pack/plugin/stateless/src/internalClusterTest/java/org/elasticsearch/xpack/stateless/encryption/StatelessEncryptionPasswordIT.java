@@ -117,12 +117,18 @@ public class StatelessEncryptionPasswordIT extends AbstractStatelessPluginIntegT
 
     /**
      * With keystore passwords, a master-eligible node without one can't join once the key is installed, while index and search nodes,
-     * which don't persist cluster state, need none. Each master-eligible node may use its own password.
+     * which don't persist cluster state, need none. A master-eligible node with a password of its own joins, and when it takes over as
+     * master it persists the key it already holds with that password: it doesn't read the copy the previous master wrapped.
      */
     public void testMasterEligibleNodeWithoutKeystorePasswordCannotJoin() throws Exception {
+        Settings fastFailover = Settings.builder()
+            .put(StoreHeartbeatService.MAX_MISSED_HEARTBEATS.getKey(), 1)
+            .put(StoreHeartbeatService.HEARTBEAT_FREQUENCY.getKey(), TimeValue.timeValueSeconds(1))
+            .build();
         // otherwise the join is validated against the cached state from the index node's join, which has no key yet
         String master = startMasterOnlyNode(
             Settings.builder()
+                .put(fastFailover)
                 .put(JoinValidationService.JOIN_VALIDATION_CACHE_TIMEOUT_SETTING.getKey(), TimeValue.timeValueMillis(1))
                 .build()
         );
@@ -139,7 +145,7 @@ public class StatelessEncryptionPasswordIT extends AbstractStatelessPluginIntegT
         String joining;
         try (MockLog mockLog = MockLog.capture(JoinHelper.class)) {
             mockLog.addExpectation(new JoinRejectedExpectation());
-            joining = startMasterOnlyNode();
+            joining = startMasterOnlyNode(fastFailover);
             mockLog.awaitAllExpectationsMatched();
         }
         // asked on the master: a random node may be the rejected one, which has no master
@@ -149,6 +155,15 @@ public class StatelessEncryptionPasswordIT extends AbstractStatelessPluginIntegT
         reload(joining, passwordSettings("v2", "password-v2"));
         ensureStableCluster(5);
         assertTrue(hasUsableKey(masterState()));
+
+        internalCluster().stopNode(master);
+        assertBusy(() -> {
+            ClusterState state = internalCluster().clusterService(joining).state();
+            assertTrue(state.nodes().isLocalNodeElectedMaster());
+            assertTrue(hasUsableKey(state));
+        }, 30, TimeUnit.SECONDS);
+        createIndex("index-after-failover");
+        ensureGreen("index-after-failover");
 
         // stopped because the test framework's teardown writes cluster state as if to disk on a random node
         for (String node : List.of(indexNode, secondIndexNode, searchNode)) {

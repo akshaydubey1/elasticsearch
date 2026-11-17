@@ -144,7 +144,12 @@ public class ProjectEncryptionKeyMissingPasswordIT extends ESIntegTestCase {
         EncryptedData encrypted = internalCluster().getInstance(EncryptionService.class, master).encrypt(payload);
 
         internalCluster().restartNode(master);
-        assertTrue(pekOn(master).isUnwrapFailed());
+        // the restarted node may not have recovered its state yet
+        assertBusy(() -> {
+            ProjectEncryptionKeyMetadata metadata = pekOn(master);
+            assertThat(metadata, notNullValue());
+            assertTrue(metadata.isUnwrapFailed());
+        });
         EncryptionServiceUnavailableException e = expectThrows(
             EncryptionServiceUnavailableException.class,
             () -> decryptOn(master, encrypted)
@@ -188,6 +193,8 @@ public class ProjectEncryptionKeyMissingPasswordIT extends ESIntegTestCase {
         assertBusy(() -> {
             assertThat(internalCluster().getMasterName(), equalTo(other));
             assertFalse(pekOn(other).isUnwrapFailed());
+            // the former master gets the restored key from the next publication
+            assertFalse(pekOn(master).isUnwrapFailed());
         }, 30, TimeUnit.SECONDS);
         assertArrayEquals(payload, decryptOn(master, encrypted));
         ClearVotingConfigExclusionsRequest clear = new ClearVotingConfigExclusionsRequest(TEST_REQUEST_TIMEOUT);

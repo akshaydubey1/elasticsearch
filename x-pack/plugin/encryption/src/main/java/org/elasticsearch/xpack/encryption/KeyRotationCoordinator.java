@@ -558,7 +558,8 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
                 .filter(r -> r.canPersist() == false)
                 .map(r -> r.getNode().getName())
                 .collect(Collectors.toCollection(TreeSet::new));
-            if (notReady.isEmpty() == false && notReady.equals(this.nodesWithoutPEKPassword.getAndSet(notReady)) == false) {
+            Set<String> previouslyNotReady = this.nodesWithoutPEKPassword.getAndSet(notReady.isEmpty() ? null : notReady);
+            if (notReady.isEmpty() == false && notReady.equals(previouslyNotReady) == false) {
                 logger.warn(
                     "project encryption key not {} yet: nodes {} cannot persist it. Configure [{}] and the matching [{}<id>]"
                         + " secure setting on every master-eligible and data node and reload secure settings",
