@@ -7,9 +7,13 @@
 
 package org.elasticsearch.xpack.esql.optimizer.rules.logical.promql;
 
+import org.elasticsearch.Build;
 import org.elasticsearch.common.lucene.BytesRefs;
 import org.elasticsearch.core.Nullable;
+import org.elasticsearch.xpack.esql.VerificationException;
+import org.elasticsearch.xpack.esql.action.EsqlCapabilities;
 import org.elasticsearch.xpack.esql.analysis.AnalyzerContext;
+import org.elasticsearch.xpack.esql.common.Failure;
 import org.elasticsearch.xpack.esql.core.expression.Alias;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
@@ -84,6 +88,9 @@ import java.util.TreeSet;
  *     <li>From the leaves up, each node on its own: a node that defines a container promotes the labels read by name to
  *     attributes next to it, and a node that names a container names the container that is left and its promoted labels.</li>
  * </ol>
+ * Where a node before 9.7 takes part ({@link #usesLabelContainer}), a container is the keyword {@code _timeseries} the source
+ * loads, and nothing can change it after that. The same two steps run, and a plan that is left with a call changing a container
+ * fails.
  */
 public final class ScalarizeTimeSeriesMetadataPaths extends ParameterizedRule<LogicalPlan, LogicalPlan, AnalyzerContext> {
 
@@ -93,15 +100,32 @@ public final class ScalarizeTimeSeriesMetadataPaths extends ParameterizedRule<Lo
         if (context.configuration().pragmas().enablePromqlTranslationV2() == false) {
             return plan;
         }
-        return pushDown(plan, context.configuration());
+        return pushDown(plan, context.configuration(), usesLabelContainer(context));
     }
 
-    /** {@code plan} with its label containers split into parts; {@code configuration} renders the ones left whole. */
+    /**
+     * Whether {@code _timeseries} is a typed label container for this query: the feature is on and every participating node reads
+     * it. Otherwise what is left of a container stays keyword.
+     */
+    static boolean usesLabelContainer(AnalyzerContext context) {
+        return EsqlCapabilities.Cap.ENABLE_TSMD_DATA_TYPE.isEnabled()
+            && DataType.TIME_SERIES_METADATA_DATA_TYPE.supportedVersion()
+                .supportedOn(context.minimumVersion(), Build.current().isSnapshot());
+    }
+
     static LogicalPlan pushDown(LogicalPlan plan, Configuration configuration) {
+        return pushDown(plan, configuration, true);
+    }
+
+    /**
+     * {@code plan} with its label containers split into parts; {@code configuration} renders the ones left whole. Without
+     * {@code typed} a node before 9.7 takes part: what is left of a container stays the keyword {@code _timeseries} of the source.
+     */
+    static LogicalPlan pushDown(LogicalPlan plan, Configuration configuration, boolean typed) {
         if (plan.anyMatch(ScalarizeTimeSeriesMetadataPaths::readsSource) == false) {
             return plan;
         }
-        return new Pushdown(configuration).apply(plan);
+        return new Pushdown(configuration, typed).apply(plan);
     }
 
     /** The source's label container, as translation reads it: every label of the series. */
@@ -205,6 +229,8 @@ public final class ScalarizeTimeSeriesMetadataPaths extends ParameterizedRule<Lo
      */
     static final class Pushdown {
         private final Configuration configuration;
+        /** Whether every node reads the typed label container; otherwise a container stays the keyword the source loads. */
+        private final boolean typed;
 
         /** Step 1: the labels read by name off each container. */
         private final Map<NameId, Set<String>> need = new HashMap<>();
@@ -229,13 +255,27 @@ public final class ScalarizeTimeSeriesMetadataPaths extends ParameterizedRule<Lo
         /** The input of the time-series aggregate whose groupings are being rewritten: where the source's labels are read. */
         private LogicalPlan source;
 
-        Pushdown(Configuration configuration) {
+        Pushdown(Configuration configuration, boolean typed) {
             this.configuration = configuration;
+            this.typed = typed;
         }
 
         LogicalPlan apply(LogicalPlan plan) {
             demand(plan);
-            return rewrite(plan);
+            LogicalPlan rewritten = rewrite(plan);
+            if (typed == false) {
+                // A keyword container cannot change after the source loads it: no call that changes one may be left.
+                rewritten.forEachDown(node -> node.forEachExpression(Expression.class, e -> {
+                    if (e instanceof TimeSeriesMetadataFilter || e instanceof TimeSeriesMetadataSet) {
+                        throw new VerificationException(
+                            List.of(
+                                Failure.fail(e, "leaving labels out of _timeseries requires a typed label container [{}]", e.sourceText())
+                            )
+                        );
+                    }
+                }));
+            }
+            return rewritten;
         }
 
         // -- step 1: what the plan asks of its containers. From the root down, so every use is seen before the definition --
@@ -531,7 +571,7 @@ public final class ScalarizeTimeSeriesMetadataPaths extends ParameterizedRule<Lo
                             }
                             // Union outputs are named apart: the container's own name for the container, prefixed for its labels.
                             names.add(out.name());
-                            types.add(DataType.TIME_SERIES_METADATA_DATA_TYPE);
+                            types.add(typed ? DataType.TIME_SERIES_METADATA_DATA_TYPE : DataType.KEYWORD);
                             parts.add(branchParts);
                         }
                         var outLabels = new ArrayList<String>();
@@ -880,7 +920,7 @@ public final class ScalarizeTimeSeriesMetadataPaths extends ParameterizedRule<Lo
                             // container leaves it out.
                             var leftOut = new TreeSet<String>();
                             var rightOut = new TreeSet<String>();
-                            for (String name : names) {
+                            for (String name : typed ? names : Set.<String>of()) {
                                 if (inContainer(l, name) && inContainer(r, name) == false) {
                                     leftOut.add(name);
                                 } else if (inContainer(r, name) && inContainer(l, name) == false) {
@@ -1084,7 +1124,8 @@ public final class ScalarizeTimeSeriesMetadataPaths extends ParameterizedRule<Lo
         /**
          * {@code container}, already without {@code gone}, without {@code names} as well. The source's labels leave them out where
          * the aggregate loads them. A container a time-series aggregate loads holds dimensions only, so it is without any other
-         * name already.
+         * name already; where it is keyword it cannot change, and a use that leaves out more reads it as it is, as the keyword
+         * translation did.
          */
         private @Nullable Expression unset(@Nullable Expression container, Set<String> gone, Collection<String> names, Source at) {
             if (container == null || isSource(container) || gone.containsAll(names)) {
@@ -1095,7 +1136,7 @@ public final class ScalarizeTimeSeriesMetadataPaths extends ParameterizedRule<Lo
             LogicalPlan series = base(container) instanceof Attribute loaded ? sources.get(loaded.id()) : null;
             if (series != null) {
                 left.removeIf(name -> PromqlLabels.getLabel(series, name) == null);
-                if (left.isEmpty()) {
+                if (left.isEmpty() || typed == false) {
                     return container;
                 }
             }
@@ -1134,14 +1175,14 @@ public final class ScalarizeTimeSeriesMetadataPaths extends ParameterizedRule<Lo
                     fields.add(field);
                 }
             }
-            return new TimeSeriesWithout(Source.EMPTY, fields, DataType.TIME_SERIES_METADATA_DATA_TYPE);
+            return new TimeSeriesWithout(Source.EMPTY, fields, typed ? DataType.TIME_SERIES_METADATA_DATA_TYPE : DataType.KEYWORD);
         }
 
         /** The container {@code id} as a whole: the container with the promoted labels it is without written back. */
         private Expression whole(NameId id, Source at) {
             Expression whole = container(id);
             if (whole == null) {
-                whole = TranslationContextV2.emptyLabels(at);
+                whole = typed ? TranslationContextV2.emptyLabels(at) : absent(at);
             }
             for (var label : promoted.getOrDefault(id, new TreeMap<>()).entrySet()) {
                 if (inContainer(id, label.getKey()) == false) {
@@ -1184,7 +1225,7 @@ public final class ScalarizeTimeSeriesMetadataPaths extends ParameterizedRule<Lo
                 case ToString render when render.field().dataType() == DataType.TIME_SERIES_METADATA_DATA_TYPE && reads(render.field()) -> {
                     Source at = render.source();
                     Expression whole = whole(record(render.field()), at);
-                    yield new ToString(at, whole, configuration);
+                    yield typed ? new ToString(at, whole, configuration) : whole;
                 }
                 case HashOffset hash -> {
                     var keys = new ArrayList<Expression>();
@@ -1215,9 +1256,9 @@ public final class ScalarizeTimeSeriesMetadataPaths extends ParameterizedRule<Lo
         private Expression containerKey(NameId id, Set<String> out, Source at) {
             Expression container = unset(container(id), without.get(id), out, at);
             if (container == null) {
-                container = TranslationContextV2.emptyLabels(at);
+                container = typed ? TranslationContextV2.emptyLabels(at) : absent(at);
             }
-            return new Coalesce(at, new ToString(at, container, configuration), List.of(Literal.keyword(at, "")));
+            return new Coalesce(at, typed ? new ToString(at, container, configuration) : container, List.of(Literal.keyword(at, "")));
         }
 
     }
