@@ -245,18 +245,12 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
      */
     void reload() {
         threadPool.generic().execute(() -> {
-            if (closed) return;
             Object retry = pendingPersistCheckRetry.get();
             if (retry != null) {
                 retryPersistCheck(retry);
-                return;
+            } else {
+                recheckIfMaster();
             }
-            ClusterState state = clusterService.state();
-            if (state.blocks().hasGlobalBlock(GatewayService.STATE_NOT_RECOVERED_BLOCK)
-                || state.nodes().isLocalNodeElectedMaster() == false) {
-                return;
-            }
-            checkPasswordId(state);
         });
     }
 
@@ -604,11 +598,7 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
         );
     }
 
-    /**
-     * Releases the check and runs it again after {@link #PERSIST_CHECK_RETRY_INTERVAL}. Nodes don't tell the master when they reload
-     * secure settings, so it has to ask again. A secure settings reload on this node, or a node that persists cluster state joining or
-     * leaving, retries earlier.
-     */
+    // nodes don't tell the master when they reload secure settings, so it has to ask again
     private void retryPersistCheckLater() {
         Object retry = new Object();
         pendingPersistCheckRetry.set(retry);
@@ -638,10 +628,6 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
         }
     }
 
-    /**
-     * Restores the key from this node's own copy on disk, which it may be able to read once it has the password it is wrapped with. As
-     * with the install, only once every node that persists cluster state can wrap the key, since those that can't would fail to persist.
-     */
     private void scheduleRestore(ProjectEncryptionKeyMetadata degraded, ClusterState state) {
         String activeKeyId = degraded.getActiveKeyId();
         ProjectEncryptionKeyMetadata keys = keysReadFromDisk.get();

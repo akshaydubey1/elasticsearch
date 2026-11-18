@@ -4,9 +4,8 @@
  * 2.0; you may not use this file except in compliance with the Elastic License
  * 2.0.
  */
-package org.elasticsearch.xpack.stateless.encryption;
+package org.elasticsearch.xpack.encryption;
 
-import org.apache.logging.log4j.core.LogEvent;
 import org.apache.lucene.tests.util.LuceneTestCase;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.coordination.JoinHelper;
@@ -16,14 +15,11 @@ import org.elasticsearch.cluster.metadata.ReservedStateMetadata;
 import org.elasticsearch.common.Priority;
 import org.elasticsearch.common.settings.MockSecureSettings;
 import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.core.Strings;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.reservedstate.service.FileSettingsService;
 import org.elasticsearch.test.ESIntegTestCase;
 import org.elasticsearch.test.MockLog;
-import org.elasticsearch.xpack.encryption.EncryptionPlugin;
-import org.elasticsearch.xpack.encryption.PasswordPekEncryption;
 import org.elasticsearch.xpack.stateless.AbstractStatelessPluginIntegTestCase;
 import org.elasticsearch.xpack.stateless.settings.secure.SecureSettingsPlugin;
 import org.junit.Before;
@@ -34,15 +30,10 @@ import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
-import static org.elasticsearch.xpack.encryption.EncryptionPasswordTestUtil.ACTIVE_PASSWORD_ID_KEY;
-import static org.elasticsearch.xpack.encryption.EncryptionPasswordTestUtil.PASSWORD_KEY_PREFIX;
-import static org.elasticsearch.xpack.encryption.EncryptionPasswordTestUtil.canWrapForDisk;
-import static org.elasticsearch.xpack.encryption.EncryptionPasswordTestUtil.hasUsableKey;
-import static org.elasticsearch.xpack.encryption.EncryptionPasswordTestUtil.keyPasswordId;
-import static org.elasticsearch.xpack.encryption.EncryptionPasswordTestUtil.keyUnwrapFailed;
+import static org.elasticsearch.xpack.encryption.ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY;
+import static org.elasticsearch.xpack.encryption.ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX;
 import static org.hamcrest.Matchers.equalTo;
 
 /**
@@ -56,6 +47,11 @@ import static org.hamcrest.Matchers.equalTo;
 // not auto-managed, so that starting a master-eligible node that is rejected at join doesn't wait for it to join
 @ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, numDataNodes = 0, numClientNodes = 0, autoManageMasterNodes = false)
 public class StatelessEncryptionPasswordIT extends AbstractStatelessPluginIntegTestCase {
+
+    private static final Settings FAST_FAILOVER = Settings.builder()
+        .put(StoreHeartbeatService.MAX_MISSED_HEARTBEATS.getKey(), 1)
+        .put(StoreHeartbeatService.HEARTBEAT_FREQUENCY.getKey(), TimeValue.timeValueSeconds(1))
+        .build();
 
     @Before
     public void bootstrapFirstMaster() {
@@ -76,12 +72,12 @@ public class StatelessEncryptionPasswordIT extends AbstractStatelessPluginIntegT
         startIndexNode();
         startSearchNode();
         ensureStableCluster(3);
-        applyClusterSecrets(1, ACTIVE_PASSWORD_ID_KEY, "v1", PASSWORD_KEY_PREFIX + "v1", "password-v1");
+        applyClusterSecrets(1, ACTIVE_PASSWORD_ID_KEY, "v1", PASSWORD_PREFIX + "v1", "password-v1");
         assertBusy(() -> assertTrue(hasUsableKey(masterState())));
 
         String joining = startMasterOnlyNode();
         ensureStableCluster(4);
-        assertBusy(() -> assertTrue(canWrapForDisk(pekEncryption(joining))));
+        assertBusy(() -> assertTrue(pekEncryption(joining).canWrapForDisk()));
         assertThat(pekEncryption(joining).activePasswordId(), equalTo("v1"));
         assertTrue(hasUsableKey(masterState()));
 
@@ -99,17 +95,17 @@ public class StatelessEncryptionPasswordIT extends AbstractStatelessPluginIntegT
         startIndexNode();
         startSearchNode();
         ensureStableCluster(4);
-        applyClusterSecrets(1, ACTIVE_PASSWORD_ID_KEY, "v1", PASSWORD_KEY_PREFIX + "v1", "password-v1");
-        assertBusy(() -> assertThat(keyPasswordId(masterState()), equalTo("v1")));
+        applyClusterSecrets(1, ACTIVE_PASSWORD_ID_KEY, "v1", PASSWORD_PREFIX + "v1", "password-v1");
+        assertBusy(() -> assertThat(pek(masterState()).getPasswordId(), equalTo("v1")));
 
-        applyClusterSecrets(2, ACTIVE_PASSWORD_ID_KEY, "v2", PASSWORD_KEY_PREFIX + "v2", "password-v2");
+        applyClusterSecrets(2, ACTIVE_PASSWORD_ID_KEY, "v2", PASSWORD_PREFIX + "v2", "password-v2");
         for (String node : internalCluster().getNodeNames()) {
             assertThat(node, pekEncryption(node).activePasswordId(), equalTo("v2"));
-            assertTrue(node, canWrapForDisk(pekEncryption(node)));
+            assertTrue(node, pekEncryption(node).canWrapForDisk());
         }
         assertTrue(hasUsableKey(masterState()));
         // the key metadata follows the new password although the old one is gone
-        assertBusy(() -> assertThat(keyPasswordId(masterState()), equalTo("v2")));
+        assertBusy(() -> assertThat(pek(masterState()).getPasswordId(), equalTo("v2")));
 
         createIndex("index-after-password-change");
         ensureGreen("index-after-password-change");
@@ -121,14 +117,10 @@ public class StatelessEncryptionPasswordIT extends AbstractStatelessPluginIntegT
      * master it persists the key it already holds with that password: it doesn't read the copy the previous master wrapped.
      */
     public void testMasterEligibleNodeWithoutKeystorePasswordCannotJoin() throws Exception {
-        Settings fastFailover = Settings.builder()
-            .put(StoreHeartbeatService.MAX_MISSED_HEARTBEATS.getKey(), 1)
-            .put(StoreHeartbeatService.HEARTBEAT_FREQUENCY.getKey(), TimeValue.timeValueSeconds(1))
-            .build();
         // otherwise the join is validated against the cached state from the index node's join, which has no key yet
         String master = startMasterOnlyNode(
             Settings.builder()
-                .put(fastFailover)
+                .put(FAST_FAILOVER)
                 .put(JoinValidationService.JOIN_VALIDATION_CACHE_TIMEOUT_SETTING.getKey(), TimeValue.timeValueMillis(1))
                 .build()
         );
@@ -144,8 +136,8 @@ public class StatelessEncryptionPasswordIT extends AbstractStatelessPluginIntegT
 
         String joining;
         try (MockLog mockLog = MockLog.capture(JoinHelper.class)) {
-            mockLog.addExpectation(new JoinRejectedExpectation());
-            joining = startMasterOnlyNode(fastFailover);
+            mockLog.addExpectation(new EncryptionIntegTestUtils.JoinRejectedExpectation());
+            joining = startMasterOnlyNode(FAST_FAILOVER);
             mockLog.awaitAllExpectationsMatched();
         }
         // asked on the master: a random node may be the rejected one, which has no master
@@ -173,17 +165,12 @@ public class StatelessEncryptionPasswordIT extends AbstractStatelessPluginIntegT
 
     /** The elected master restarts without its password, so it holds no key; it restores the key once its password is reloaded. */
     public void testRestartedMasterRestoresKeyOnceItHasThePassword() throws Exception {
-        String master = startMasterOnlyNode(
-            Settings.builder()
-                .put(StoreHeartbeatService.MAX_MISSED_HEARTBEATS.getKey(), 1)
-                .put(StoreHeartbeatService.HEARTBEAT_FREQUENCY.getKey(), TimeValue.timeValueSeconds(1))
-                .build()
-        );
+        String master = startMasterOnlyNode(FAST_FAILOVER);
         reload(master, passwordSettings("v1", "password-v1"));
         assertBusy(() -> assertTrue(hasUsableKey(masterState())));
 
         internalCluster().restartNode(master);
-        assertBusy(() -> assertTrue(keyUnwrapFailed(masterState())));
+        assertBusy(() -> assertTrue(pek(masterState()).isUnwrapFailed()));
 
         reload(master, passwordSettings("v1", "password-v1"));
         assertBusy(() -> assertTrue(hasUsableKey(masterState())));
@@ -193,30 +180,9 @@ public class StatelessEncryptionPasswordIT extends AbstractStatelessPluginIntegT
     private static void applyClusterSecrets(long version, String... namesAndValues) throws Exception {
         FileSettingsService fileSettings = internalCluster().getInstance(FileSettingsService.class, internalCluster().getMasterName());
         assertBusy(() -> assertTrue(fileSettings.watching()));
-        StringBuilder secrets = new StringBuilder();
-        for (int i = 0; i < namesAndValues.length; i += 2) {
-            secrets.append(i == 0 ? "" : ",")
-                .append('"')
-                .append(namesAndValues[i])
-                .append("\":\"")
-                .append(namesAndValues[i + 1])
-                .append('"');
-        }
-        String json = Strings.format("""
-            {
-                "metadata": {
-                    "version": "%s",
-                    "compatibility": "8.4.0"
-                },
-                "state": {
-                    "cluster_secrets": {
-                        "string_secrets": {%s}
-                    }
-                }
-            }""", version, secrets);
         Files.createDirectories(fileSettings.watchedFileDir());
         Path tempFile = createTempFile();
-        Files.writeString(tempFile, json);
+        Files.writeString(tempFile, EncryptionIntegTestUtils.clusterSecretsJson(version, namesAndValues));
         Files.move(tempFile, fileSettings.watchedFile(), StandardCopyOption.ATOMIC_MOVE);
 
         assertBusy(() -> {
@@ -232,6 +198,15 @@ public class StatelessEncryptionPasswordIT extends AbstractStatelessPluginIntegT
         return internalCluster().clusterService(internalCluster().getMasterName()).state();
     }
 
+    private static ProjectEncryptionKeyMetadata pek(ClusterState state) {
+        return state.metadata().getSingleProjectCustom(ProjectEncryptionKeyMetadata.TYPE);
+    }
+
+    private static boolean hasUsableKey(ClusterState state) {
+        ProjectEncryptionKeyMetadata metadata = pek(state);
+        return metadata != null && metadata.isUnwrapFailed() == false;
+    }
+
     private static PasswordPekEncryption pekEncryption(String node) {
         return internalCluster().getInstance(PasswordPekEncryption.class, node);
     }
@@ -239,35 +214,11 @@ public class StatelessEncryptionPasswordIT extends AbstractStatelessPluginIntegT
     private static Settings passwordSettings(String passwordId, String password) {
         MockSecureSettings secure = new MockSecureSettings();
         secure.setString(ACTIVE_PASSWORD_ID_KEY, passwordId);
-        secure.setString(PASSWORD_KEY_PREFIX + passwordId, password);
+        secure.setString(PASSWORD_PREFIX + passwordId, password);
         return Settings.builder().setSecureSettings(secure).build();
     }
 
     private static void reload(String node, Settings settings) {
         findPlugin(node, EncryptionPlugin.class).reload(settings);
-    }
-
-    /** The joining node rejects the cluster's join validation, and logs the reason the master sends back. */
-    private static class JoinRejectedExpectation implements MockLog.LoggingExpectation {
-        private final CountDownLatch seen = new CountDownLatch(1);
-
-        @Override
-        public void match(LogEvent event) {
-            for (Throwable t = event.getThrown(); t != null; t = t.getCause()) {
-                if (t.getMessage() != null && t.getMessage().contains("this node cannot join the cluster")) {
-                    seen.countDown();
-                }
-            }
-        }
-
-        @Override
-        public void assertMatched() {
-            assertEquals("expected the join to be rejected", 0, seen.getCount());
-        }
-
-        @Override
-        public void awaitMatched(long millis) throws InterruptedException {
-            assertTrue("expected the join to be rejected", seen.await(millis, TimeUnit.MILLISECONDS));
-        }
     }
 }

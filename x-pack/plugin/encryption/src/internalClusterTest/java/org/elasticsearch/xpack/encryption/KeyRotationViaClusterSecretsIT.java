@@ -15,7 +15,6 @@ import org.elasticsearch.common.Priority;
 import org.elasticsearch.common.settings.ClusterSecrets;
 import org.elasticsearch.common.settings.MockSecureSettings;
 import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.core.Strings;
 import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.reservedstate.service.FileSettingsService;
 import org.elasticsearch.test.ESIntegTestCase;
@@ -59,7 +58,8 @@ import static org.hamcrest.Matchers.nullValue;
  *       PEK under the new password, and persists the result as a new {@link ProjectEncryptionKeyMetadata}.</li>
  * </ol>
  */
-@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, numDataNodes = 3, supportsDedicatedMasters = false)
+// no client nodes: they accept cluster secrets without the password, so can't serialize the state for the teardown's node tool check
+@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, numDataNodes = 3, numClientNodes = 0, supportsDedicatedMasters = false)
 public class KeyRotationViaClusterSecretsIT extends ESIntegTestCase {
 
     private static final String INITIAL_PASSWORD_ID = "v1";
@@ -237,7 +237,7 @@ public class KeyRotationViaClusterSecretsIT extends ESIntegTestCase {
 
         long version = fileSettingsVersionCounter.incrementAndGet();
         CountDownLatch applied = fileSettingsAppliedLatch(master, version);
-        writeFileSettingsJson(master, clusterSecretsJson(version, "test.unrelated.secret", "value"));
+        writeFileSettingsJson(master, EncryptionIntegTestUtils.clusterSecretsJson(version, "test.unrelated.secret", "value"));
         assertTrue("file-settings update was not applied within 30s", applied.await(30, TimeUnit.SECONDS));
         // every node has applied the cluster secrets, and so reloaded them, once the master has no pending tasks
         clusterAdmin().prepareHealth(TEST_REQUEST_TIMEOUT).setWaitForEvents(Priority.LANGUID).get();
@@ -309,48 +309,8 @@ public class KeyRotationViaClusterSecretsIT extends ESIntegTestCase {
         return latch;
     }
 
-    /** File settings whose cluster secrets hold the given secrets, as alternating names and values. */
-    static String clusterSecretsJson(long version, String... namesAndValues) {
-        StringBuilder secrets = new StringBuilder();
-        for (int i = 0; i < namesAndValues.length; i += 2) {
-            secrets.append(i == 0 ? "" : ",")
-                .append('"')
-                .append(namesAndValues[i])
-                .append("\":\"")
-                .append(namesAndValues[i + 1])
-                .append('"');
-        }
-        return Strings.format("""
-            {
-                "metadata": {
-                    "version": "%s",
-                    "compatibility": "8.4.0"
-                },
-                "state": {
-                    "cluster_secrets": {
-                        "string_secrets": {%s}
-                    }
-                }
-            }""", version, secrets);
-    }
-
     private static String rotatedPasswordOnlyJson(long version) {
-        return Strings.format(
-            """
-                {
-                    "metadata": {
-                        "version": "%s",
-                        "compatibility": "8.4.0"
-                    },
-                    "state": {
-                        "cluster_secrets": {
-                            "string_secrets": {
-                                "%s": "%s",
-                                "%s": "%s"
-                            }
-                        }
-                    }
-                }""",
+        return EncryptionIntegTestUtils.clusterSecretsJson(
             version,
             ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX + ROTATED_PASSWORD_ID,
             ROTATED_PASSWORD,
@@ -360,23 +320,7 @@ public class KeyRotationViaClusterSecretsIT extends ESIntegTestCase {
     }
 
     private static String encryptionPasswordsJson(long version, String v1Password, String v2Password, String activePasswordId) {
-        return Strings.format(
-            """
-                {
-                    "metadata": {
-                        "version": "%s",
-                        "compatibility": "8.4.0"
-                    },
-                    "state": {
-                        "cluster_secrets": {
-                            "string_secrets": {
-                                "%s": "%s",
-                                "%s": "%s",
-                                "%s": "%s"
-                            }
-                        }
-                    }
-                }""",
+        return EncryptionIntegTestUtils.clusterSecretsJson(
             version,
             ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX + INITIAL_PASSWORD_ID,
             v1Password,

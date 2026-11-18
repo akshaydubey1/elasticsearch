@@ -6,7 +6,6 @@
  */
 package org.elasticsearch.xpack.encryption;
 
-import org.apache.logging.log4j.core.LogEvent;
 import org.elasticsearch.action.admin.cluster.configuration.AddVotingConfigExclusionsRequest;
 import org.elasticsearch.action.admin.cluster.configuration.ClearVotingConfigExclusionsRequest;
 import org.elasticsearch.action.admin.cluster.configuration.TransportAddVotingConfigExclusionsAction;
@@ -74,7 +73,7 @@ public class ProjectEncryptionKeyMissingPasswordIT extends ESIntegTestCase {
 
         String joining;
         try (MockLog mockLog = MockLog.capture(JoinHelper.class)) {
-            mockLog.addExpectation(new JoinRejectedExpectation());
+            mockLog.addExpectation(new EncryptionIntegTestUtils.JoinRejectedExpectation());
             joining = internalCluster().startNode(NodeRoles.dataOnlyNode());
             mockLog.awaitAllExpectationsMatched();
         }
@@ -110,7 +109,7 @@ public class ProjectEncryptionKeyMissingPasswordIT extends ESIntegTestCase {
         CountDownLatch applied = KeyRotationViaClusterSecretsIT.fileSettingsAppliedLatch(master, 1);
         KeyRotationViaClusterSecretsIT.writeFileSettingsJson(
             master,
-            KeyRotationViaClusterSecretsIT.clusterSecretsJson(
+            EncryptionIntegTestUtils.clusterSecretsJson(
                 1,
                 ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY,
                 PASSWORD_ID,
@@ -122,7 +121,7 @@ public class ProjectEncryptionKeyMissingPasswordIT extends ESIntegTestCase {
 
         String joining;
         try (MockLog mockLog = MockLog.capture(JoinHelper.class)) {
-            mockLog.addExpectation(new JoinRejectedExpectation());
+            mockLog.addExpectation(new EncryptionIntegTestUtils.JoinRejectedExpectation());
             joining = internalCluster().startNode(NodeRoles.dataOnlyNode());
             mockLog.awaitAllExpectationsMatched();
         }
@@ -234,30 +233,6 @@ public class ProjectEncryptionKeyMissingPasswordIT extends ESIntegTestCase {
                 assertFalse(pekOn(node).isUnwrapFailed());
             }
         }, 30, TimeUnit.SECONDS);
-    }
-
-    /** The joining node rejects the cluster's join validation, and logs the reason the master sends back. */
-    private static class JoinRejectedExpectation implements MockLog.LoggingExpectation {
-        private final CountDownLatch seen = new CountDownLatch(1);
-
-        @Override
-        public void match(LogEvent event) {
-            for (Throwable t = event.getThrown(); t != null; t = t.getCause()) {
-                if (t.getMessage() != null && t.getMessage().contains("this node cannot join the cluster")) {
-                    seen.countDown();
-                }
-            }
-        }
-
-        @Override
-        public void assertMatched() {
-            assertEquals("expected the join to be rejected", 0, seen.getCount());
-        }
-
-        @Override
-        public void awaitMatched(long millis) throws InterruptedException {
-            assertTrue("expected the join to be rejected", seen.await(millis, TimeUnit.MILLISECONDS));
-        }
     }
 
     private static byte[] decryptOn(String node, EncryptedData encrypted) {
