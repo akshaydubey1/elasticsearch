@@ -96,10 +96,6 @@ public final class ScalarizeTimeSeriesMetadataPaths extends ParameterizedRule<Lo
 
     @Override
     public LogicalPlan apply(LogicalPlan plan, AnalyzerContext context) {
-        // the translation it follows emits label containers only with V2
-        if (context.configuration().pragmas().enablePromqlTranslationV2() == false) {
-            return plan;
-        }
         return pushDown(plan, context.configuration(), usesLabelContainer(context));
     }
 
@@ -107,7 +103,7 @@ public final class ScalarizeTimeSeriesMetadataPaths extends ParameterizedRule<Lo
      * Whether {@code _timeseries} is a typed label container for this query: the feature is on and every participating node reads
      * it. Otherwise what is left of a container stays keyword.
      */
-    static boolean usesLabelContainer(AnalyzerContext context) {
+    public static boolean usesLabelContainer(AnalyzerContext context) {
         return EsqlCapabilities.Cap.ENABLE_TSMD_DATA_TYPE.isEnabled()
             && DataType.TIME_SERIES_METADATA_DATA_TYPE.supportedVersion()
                 .supportedOn(context.minimumVersion(), Build.current().isSnapshot());
@@ -348,6 +344,7 @@ public final class ScalarizeTimeSeriesMetadataPaths extends ParameterizedRule<Lo
                 List<Expression> keys = switch (node) {
                     case Aggregate aggregate -> aggregate.groupings();
                     case TopNBy topNBy -> topNBy.groupings();
+                    case PackDims pack -> List.<Expression>copyOf(pack.dims());
                     default -> List.of();
                 };
                 for (Expression key : keys) {
@@ -994,6 +991,28 @@ public final class ScalarizeTimeSeriesMetadataPaths extends ParameterizedRule<Lo
                     }
                     LogicalPlan child = evaluate(topNBy.child(), evals);
                     return new TopNBy(topNBy.source(), pack(child, labels, groupings), topNBy.order(), topNBy.limitPerGroup(), groupings);
+                }
+                // The pack of the parts of its label containers: the container that is left, and each label it does not hold.
+                case PackDims pack -> {
+                    var evals = new ArrayList<Alias>();
+                    var dims = new ArrayList<Attribute>();
+                    for (Attribute dim : pack.dims()) {
+                        if (isContainer(dim) == false) {
+                            dims.add(dim);
+                            continue;
+                        }
+                        NameId id = record(dim);
+                        materialize(id, evals);
+                        if (timeseries.containsKey(id)) {
+                            dims.add((Attribute) timeseries.get(id));
+                        }
+                        promoted.get(id).forEach((name, label) -> {
+                            if (inContainer(id, name) == false) {
+                                addIfAbsent(dims, (Attribute) label);
+                            }
+                        });
+                    }
+                    return new PackDims(pack.source(), evaluate(pack.child(), evals), dims, pack.packed());
                 }
                 default -> {
                     return rewritten.transformExpressionsOnlyUp(Expression.class, this::scalar);
