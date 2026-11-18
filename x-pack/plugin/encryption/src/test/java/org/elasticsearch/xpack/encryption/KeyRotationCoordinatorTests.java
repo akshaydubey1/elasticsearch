@@ -97,8 +97,8 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
     }
 
     private static DiscoveryNodes nodes(boolean isLocalMaster) {
-        DiscoveryNode local = DiscoveryNodeUtils.create("local", "local");
-        DiscoveryNode other = DiscoveryNodeUtils.create("other", "other");
+        DiscoveryNode local = DiscoveryNodeUtils.builder("local").name("local").ephemeralId("local").build();
+        DiscoveryNode other = DiscoveryNodeUtils.builder("other").name("other").ephemeralId("other").build();
         DiscoveryNodes.Builder builder = DiscoveryNodes.builder().add(local).add(other).localNodeId("local");
         builder.masterNodeId(isLocalMaster ? "local" : "other");
         return builder.build();

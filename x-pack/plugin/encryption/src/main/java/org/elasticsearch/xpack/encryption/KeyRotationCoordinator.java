@@ -532,7 +532,7 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
 
         ActionListener<TransportCanPersistKeyAction.Response> listener = ActionListener.wrap(response -> {
             Set<String> ready = response.readyNodeIds();
-            if (Arrays.stream(nodes).allMatch(node -> ready.contains(node.getId()))) {
+            if (Arrays.stream(nodes).allMatch(node -> ready.contains(node.getEphemeralId()))) {
                 nodesWithoutPEKPassword.set(null);
                 try {
                     onReady.accept(ready);
@@ -762,8 +762,8 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
     }
 
     /**
-     * Installs the first key, but only if every node that persists cluster state is among {@code readyNodeIds}, the nodes that reported
-     * they can persist the key. {@code null} when the passwords come from cluster secrets and no node is checked.
+     * Installs the first key, but only if every node that persists cluster state is among {@code readyNodeIds}, the ephemeral ids of the
+     * nodes that reported they can persist the key. {@code null} when the passwords come from cluster secrets and no node is checked.
      */
     record InstallKeyTask(String keyId, byte[] pekBytes, String passwordId, long generatedAt, @Nullable Set<String> readyNodeIds)
         implements
@@ -934,7 +934,7 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
                     .stream()
                     .noneMatch(
                         node -> PasswordPekEncryption.persistsClusterState(node.getRoles(), stateless)
-                            && readyNodeIds.contains(node.getId()) == false
+                            && readyNodeIds.contains(node.getEphemeralId()) == false
                     );
         }
 

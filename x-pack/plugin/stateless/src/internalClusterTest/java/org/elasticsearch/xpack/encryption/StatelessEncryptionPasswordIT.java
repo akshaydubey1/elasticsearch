@@ -114,8 +114,8 @@ public class StatelessEncryptionPasswordIT extends AbstractStatelessPluginIntegT
 
     /**
      * With keystore passwords, a master-eligible node without one can't join once the key is installed, while index and search nodes,
-     * which don't persist cluster state, need none. A master-eligible node with a password of its own joins, and when it takes over as
-     * master it persists the key it already holds with that password: it doesn't read the copy the previous master wrapped.
+     * which don't persist cluster state, need none. A master-eligible node with a password of its own joins, and when it takes over from
+     * a running master it persists the key it already holds with that password: it doesn't read the copy the previous master wrapped.
      */
     public void testMasterEligibleNodeWithoutKeystorePasswordCannotJoin() throws Exception {
         // otherwise the join is validated against the cached state from the index node's join, which has no key yet

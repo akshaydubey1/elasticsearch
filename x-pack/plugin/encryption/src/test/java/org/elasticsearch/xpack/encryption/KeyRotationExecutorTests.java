@@ -11,6 +11,7 @@ import org.elasticsearch.cluster.ClusterName;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.metadata.Metadata;
 import org.elasticsearch.cluster.metadata.ProjectMetadata;
+import org.elasticsearch.cluster.node.DiscoveryNode;
 import org.elasticsearch.cluster.node.DiscoveryNodeRole;
 import org.elasticsearch.cluster.node.DiscoveryNodeUtils;
 import org.elasticsearch.cluster.node.DiscoveryNodes;
@@ -255,36 +256,43 @@ public class KeyRotationExecutorTests extends ESTestCase {
 
     /**
      * The install goes ahead only if every node that writes cluster state to disk reported it can persist the key: one that joined since
-     * the check may not, while a coordinating-only node doesn't need to.
+     * the check, or restarted since it answered, may not, while a coordinating-only node doesn't need to.
      */
     public void testInstallRequiresEveryNodeThatPersistsClusterStateToBeReady() {
+        DiscoveryNode ready = DiscoveryNodeUtils.create("ready");
+        DiscoveryNode joined = DiscoveryNodeUtils.create("joined");
         ClusterState state = ClusterState.builder(stateWith(null))
-            .nodes(
-                DiscoveryNodes.builder()
-                    .add(DiscoveryNodeUtils.create("ready"))
-                    .add(DiscoveryNodeUtils.create("joined"))
-                    .add(DiscoveryNodeUtils.builder("coordinating").roles(Set.of()).build())
-            )
+            .nodes(DiscoveryNodes.builder().add(ready).add(joined).add(DiscoveryNodeUtils.builder("coordinating").roles(Set.of()).build()))
             .build();
         String keyId = ProjectEncryptionKeyMetadata.generateKeyId();
-        assertSame(state, executor.executeTask(installTask(keyId, Set.of("ready")), state).v1());
-        assertEquals(keyId, metadataOf(executor.executeTask(installTask(keyId, Set.of("ready", "joined")), state).v1()).getActiveKeyId());
+        assertSame(state, executor.executeTask(installTask(keyId, Set.of(ready.getEphemeralId())), state).v1());
+        String beforeRestart = randomValueOtherThan(joined.getEphemeralId(), ESTestCase::randomIdentifier);
+        assertSame(state, executor.executeTask(installTask(keyId, Set.of(ready.getEphemeralId(), beforeRestart)), state).v1());
+        assertEquals(
+            keyId,
+            metadataOf(executor.executeTask(installTask(keyId, Set.of(ready.getEphemeralId(), joined.getEphemeralId())), state).v1())
+                .getActiveKeyId()
+        );
     }
 
     /** On stateless only master-eligible nodes persist cluster state, to the object store, so only they must be ready. */
     public void testStatelessInstallRequiresEveryMasterEligibleNodeToBeReady() {
         var statelessExecutor = new KeyRotationCoordinator.KeyRotationExecutor(DefaultProjectResolver.INSTANCE, NO_OP_ENCRYPTION, true);
+        DiscoveryNode master = DiscoveryNodeUtils.builder("master").roles(Set.of(DiscoveryNodeRole.MASTER_ROLE)).build();
         ClusterState state = ClusterState.builder(stateWith(null))
             .nodes(
                 DiscoveryNodes.builder()
-                    .add(DiscoveryNodeUtils.builder("master").roles(Set.of(DiscoveryNodeRole.MASTER_ROLE)).build())
+                    .add(master)
                     .add(DiscoveryNodeUtils.builder("index").roles(Set.of(DiscoveryNodeRole.INDEX_ROLE)).build())
                     .add(DiscoveryNodeUtils.builder("search").roles(Set.of(DiscoveryNodeRole.SEARCH_ROLE)).build())
             )
             .build();
         String keyId = ProjectEncryptionKeyMetadata.generateKeyId();
         assertSame(state, statelessExecutor.executeTask(installTask(keyId, Set.of()), state).v1());
-        assertEquals(keyId, metadataOf(statelessExecutor.executeTask(installTask(keyId, Set.of("master")), state).v1()).getActiveKeyId());
+        assertEquals(
+            keyId,
+            metadataOf(statelessExecutor.executeTask(installTask(keyId, Set.of(master.getEphemeralId())), state).v1()).getActiveKeyId()
+        );
     }
 
     /** With passwords from cluster secrets no node is checked, since every node gets the same password. */
@@ -326,12 +334,17 @@ public class KeyRotationExecutorTests extends ESTestCase {
             Map.of(),
             NO_OP_ENCRYPTION
         );
-        ClusterState state = ClusterState.builder(stateWith(degraded("k1")))
-            .nodes(DiscoveryNodes.builder().add(DiscoveryNodeUtils.create("ready")).add(DiscoveryNodeUtils.create("joined")))
-            .build();
-        assertSame(state, executor.executeTask(new KeyRotationCoordinator.RestoreKeysTask(keys, Set.of("ready")), state).v1());
-        ClusterState restored = executor.executeTask(new KeyRotationCoordinator.RestoreKeysTask(keys, Set.of("ready", "joined")), state)
-            .v1();
+        DiscoveryNode ready = DiscoveryNodeUtils.create("ready");
+        DiscoveryNode joined = DiscoveryNodeUtils.create("joined");
+        ClusterState state = ClusterState.builder(stateWith(degraded("k1"))).nodes(DiscoveryNodes.builder().add(ready).add(joined)).build();
+        assertSame(
+            state,
+            executor.executeTask(new KeyRotationCoordinator.RestoreKeysTask(keys, Set.of(ready.getEphemeralId())), state).v1()
+        );
+        ClusterState restored = executor.executeTask(
+            new KeyRotationCoordinator.RestoreKeysTask(keys, Set.of(ready.getEphemeralId(), joined.getEphemeralId())),
+            state
+        ).v1();
         assertSame(keys, metadataOf(restored));
     }
 

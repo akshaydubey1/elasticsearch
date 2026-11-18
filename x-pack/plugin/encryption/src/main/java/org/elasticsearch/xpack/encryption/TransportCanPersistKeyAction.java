@@ -93,10 +93,11 @@ public class TransportCanPersistKeyAction extends TransportNodesAction<
             super(clusterName, nodes, failures);
         }
 
+        /** Ephemeral ids, so that a node that restarts after answering, possibly without its password, is no longer counted as ready. */
         Set<String> readyNodeIds() {
             return getNodes().stream()
                 .filter(NodeResponse::canPersist)
-                .map(r -> r.getNode().getId())
+                .map(r -> r.getNode().getEphemeralId())
                 .collect(Collectors.toUnmodifiableSet());
         }
 
