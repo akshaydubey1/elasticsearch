@@ -34,6 +34,10 @@ import org.elasticsearch.xpack.esql.expression.function.grouping.TimeSeriesWitho
 import org.elasticsearch.xpack.esql.expression.function.scalar.conditional.Case;
 import org.elasticsearch.xpack.esql.expression.function.scalar.convert.ToDatetime;
 import org.elasticsearch.xpack.esql.expression.function.scalar.convert.ToDouble;
+import org.elasticsearch.xpack.esql.expression.function.scalar.convert.ToString;
+import org.elasticsearch.xpack.esql.expression.function.scalar.timeseries.TimeSeriesMetadataFilter;
+import org.elasticsearch.xpack.esql.expression.function.scalar.timeseries.TimeSeriesMetadataPath;
+import org.elasticsearch.xpack.esql.expression.function.scalar.timeseries.TimeSeriesMetadataSet;
 import org.elasticsearch.xpack.esql.expression.predicate.logical.And;
 import org.elasticsearch.xpack.esql.expression.predicate.logical.Not;
 import org.elasticsearch.xpack.esql.expression.predicate.nulls.IsNotNull;
@@ -42,8 +46,10 @@ import org.elasticsearch.xpack.esql.expression.predicate.operator.arithmetic.Sub
 import org.elasticsearch.xpack.esql.expression.predicate.operator.comparison.Equals;
 import org.elasticsearch.xpack.esql.expression.predicate.operator.comparison.GreaterThanOrEqual;
 import org.elasticsearch.xpack.esql.expression.predicate.operator.comparison.LessThanOrEqual;
+import org.elasticsearch.xpack.esql.optimizer.rules.logical.TemporaryNameGenerator;
 import org.elasticsearch.xpack.esql.parser.promql.PromqlLogicalPlanBuilder;
 import org.elasticsearch.xpack.esql.plan.logical.Aggregate;
+import org.elasticsearch.xpack.esql.plan.logical.DistinctBy;
 import org.elasticsearch.xpack.esql.plan.logical.EsRelation;
 import org.elasticsearch.xpack.esql.plan.logical.Eval;
 import org.elasticsearch.xpack.esql.plan.logical.Filter;
@@ -56,11 +62,10 @@ import org.elasticsearch.xpack.esql.plan.logical.UnionAll;
 import org.elasticsearch.xpack.esql.plan.logical.UnpackDims;
 import org.elasticsearch.xpack.esql.plan.logical.join.HashJoin;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult.Kind;
-import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinaryComparison;
 import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinaryOperator;
 import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinarySet;
 import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorMatch;
-import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LiteralSelector;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatcher;
 import org.elasticsearch.xpack.esql.session.Configuration;
 
 import java.time.Instant;
@@ -69,9 +74,12 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.stream.Stream;
 
 import static org.elasticsearch.xpack.esql.expression.predicate.Predicates.combineAndNullable;
 import static org.elasticsearch.xpack.esql.plan.logical.promql.PromqlLabels.PROMETHEUS_LABELS_PREFIX;
@@ -104,6 +112,18 @@ public record TranslationContext(
         this(cmd, analyzer, null, open(), null);
     }
 
+    /**
+     * The translation of a child whose result drops the metric name, as most Prometheus functions and operators do: every
+     * packing the enclosing translation requires leaves {@code __name__} out, and a {@code __name__} it requires by name reads
+     * as absent. Only a source storing the metric name as a dimension holds one to drop.
+     */
+    public TranslationContext withoutMetricName() {
+        if (cmd.storesMetricName() == false) {
+            return this;
+        }
+        return withRequired(TranslationSchema.subtract(required, List.of(LabelMatcher.NAME)));
+    }
+
     /** Translate an independent child without changing the enclosing branch's timing or aggregation state. */
     public TranslationContext withRequired(TranslationSchema childRequired) {
         return new TranslationContext(cmd, analyzer, stepBucketAlias, childRequired, time);
@@ -124,6 +144,14 @@ public record TranslationContext(
         return analyzer.configuration();
     }
 
+    /**
+     * Whether the translation may read and rewrite labels in a {@code _timeseries} with the label container functions: only
+     * when every node knows them.
+     */
+    public boolean containerFunctions() {
+        return PromqlCommand.containerFunctions(analyzer.minimumVersion());
+    }
+
     public Attribute stepAttr() {
         return stepBucketAlias != null ? stepBucketAlias.toAttribute() : cmd.stepAttribute();
     }
@@ -141,7 +169,8 @@ public record TranslationContext(
         if (cmd.promqlPlan() instanceof VectorBinaryOperator op) {
             VectorMatch match = op.match();
             if (match.filter() != VectorMatch.Filter.NONE || match.grouping() != Joining.NONE) {
-                return doTranslateFinal(op.translateJoin(this).plan(), false);
+                IntermediateResult matched = op.translateMatched(this);
+                return doTranslateFinal(emitTimeSeriesAlias(matched, new NameId()), false);
             }
         }
 
@@ -153,8 +182,8 @@ public record TranslationContext(
 
         if (branches.size() == 1) {
             IntermediateResult intermediateResult = translateIntermediate(cmd.promqlPlan(), cmd.stepId(), cmd.valueId());
-            Attribute declared = find(cmd.output(), mapOpen());
-            LogicalPlan plan = emitTimeSeriesAlias(intermediateResult, declared != null ? declared.id() : new NameId());
+            // A fresh id: the command projection binds the declared _timeseries to it by name.
+            LogicalPlan plan = emitTimeSeriesAlias(intermediateResult, new NameId());
             return doTranslateFinal(plan, intermediateResult.kind().constant);
         }
         // Compile every branch as its own module (own step/value ids, own shifted evaluation timestamp), then link.
@@ -173,16 +202,47 @@ public record TranslationContext(
     /**
      * A finished table exposes its packing under the canonical {@code _timeseries} name. Packings travel under
      * their derived names so nodes can tell them apart; the one surviving at a root is whatever the enclosing
-     * regroups left, and the command declares it as {@code _timeseries}.
+     * regroups left, and the command declares it as {@code _timeseries}. With the label container functions it is
+     * the canonical label container, so a packing loaded from the source and one a translation rewrote read alike.
      */
     private LogicalPlan emitTimeSeriesAlias(IntermediateResult table, NameId id) {
         Set<String> skip = table.schema().finestSkip();
-        if (skip == null || skip.isEmpty()) {
+        if (skip == null || (skip.isEmpty() && containerFunctions() == false)) {
             return table.plan();
         }
         Attribute packed = table.packed(skip);
         assert packed != null : "invariant: packing " + skip + " must be carried by the finished table";
-        return new Eval(cmd.source(), table.plan(), List.of(new Alias(cmd.source(), MetadataAttribute.TIMESERIES, packed, id)));
+        Expression value = packed;
+        if (containerFunctions()) {
+            // A label the command outputs as a column of its own is left out of _timeseries, so each label shows once; a
+            // sort_by_label key is a column only to sort by.
+            var sortKeys = new HashSet<String>();
+            for (SortByLabelFunction sort : cmd.promqlPlan().collect(SortByLabelFunction.class)) {
+                sort.usableSortLabels().forEach(label -> sortKeys.add(mapFinite(label)));
+            }
+            var promoted = new TreeSet<String>();
+            for (Attribute attribute : cmd.output()) {
+                String name = attribute.name();
+                String label = mapFinite(attribute);
+                if (MetadataAttribute.isTimeSeriesAttributeName(name) == false
+                    && name.equals(cmd.valueColumnName()) == false
+                    && name.equals(cmd.stepColumnName()) == false
+                    && skip.contains(label) == false
+                    && sortKeys.contains(label) == false) {
+                    promoted.add(label);
+                }
+            }
+            value = unset(packed, promoted.stream());
+        }
+        return new Eval(cmd.source(), table.plan(), List.of(new Alias(cmd.source(), MetadataAttribute.TIMESERIES, value, id)));
+    }
+
+    /**
+     * The canonical label container of a packing: labels named as PromQL names them and sorted, so equal label sets compare
+     * equal whether the source held them nested, prefixed or in another order.
+     */
+    public static Expression canonical(Expression packing) {
+        return new TimeSeriesMetadataFilter(packing.source(), packing, List.of(), true);
     }
 
     /**
@@ -220,18 +280,27 @@ public record TranslationContext(
         List<Attribute> unionOutput = VectorBinarySet.unionOutputByName(branchPlans);
         var union = new UnionAll(source, branchPlans, unionOutput);
 
-        // Left-preferring dedup: group by every column except the value and the branch tag, keep the lowest branch.
+        // Left-preferring dedup: group by every column except the value and the branch tag, keep the lowest branch. With the
+        // label container functions a series' labels group without the metric name, which Prometheus' or leaves out.
         var groupings = new ArrayList<Expression>();
         Attribute branchAttr = null;
+        LogicalPlan plan = union;
         for (Attribute attr : unionOutput) {
             if (attr.name().equals(cmd.branchColumnName())) {
                 branchAttr = attr;
+            } else if (attr.name().startsWith(MetadataAttribute.TIMESERIES + "$")) {
+                // a packing a branch derives from its _timeseries, which already keys the series
+                continue;
+            } else if (attr.name().equals(MetadataAttribute.TIMESERIES) && containerFunctions()) {
+                Alias signature = new Alias(source, "$prom_sig", unset(attr, Stream.of(LabelMatcher.NAME)));
+                plan = new Eval(source, plan, List.of(signature));
+                groupings.add(signature.toAttribute());
             } else if (attr.name().equals(cmd.valueColumnName()) == false) {
                 groupings.add(attr);
             }
         }
         var order = new Order(source, branchAttr, Order.OrderDirection.ASC, Order.NullsPosition.LAST);
-        return new TopNBy(source, union, List.of(order), new Literal(source, 1, DataType.INTEGER), groupings);
+        return new TopNBy(source, plan, List.of(order), new Literal(source, 1, DataType.INTEGER), groupings);
     }
 
     /**
@@ -258,16 +327,6 @@ public record TranslationContext(
                 IntermediateResult collapsed = collapse(ir.with(plan, ir.schema(), value), ir.schema(), value);
                 plan = collapsed.plan();
                 value = collapsed.value();
-            }
-            if (branch instanceof VectorBinaryComparison comparison && comparison.filterMode()) {
-                VectorMatch match = comparison.match();
-                if ((match.filter() != VectorMatch.Filter.NONE || match.grouping() != Joining.NONE) == false) {
-                    // Filter-mode comparison (metric > x): keep the left operand's value, filter rows by the comparison.
-                    // A vector-matched comparison already applied its filter inside the join translation.
-                    ToDouble right = new ToDouble(comparison.right().source(), ((LiteralSelector) comparison.right()).literal());
-                    var condition = comparison.op().asFunction().create(comparison.source(), value, right, configuration());
-                    plan = new Filter(comparison.source(), plan, condition);
-                }
             }
         }
 
@@ -369,9 +428,20 @@ public record TranslationContext(
         // Every packing is materialized under its derived name, finest first, and every label the relation has is a
         // key too. Every column is functionally dependent on the finest packing, so grouping by all of them
         // preserves per-series granularity while making the full schema available to the surrounding query.
+        // With the label container functions only the finest packing loads: each coarser one leaves more labels out of
+        // it after the aggregate, as the source loads one _timeseries per relation.
         var groupKeys = new ArrayList<NamedExpression>();
         var outKeys = new ArrayList<NamedExpression>();
+        var derived = new ArrayList<Alias>();
+        Set<String> finest = null;
+        Attribute finestPacking = null;
         for (Set<String> skip : finestFirst(schema.skips())) {
+            if (finestPacking != null && containerFunctions() && skip.containsAll(finest)) {
+                var extra = new TreeSet<>(skip);
+                extra.removeAll(finest);
+                derived.add(new Alias(source, mapOpen(skip), unset(finestPacking, extra.stream())));
+                continue;
+            }
             List<Expression> excluded = skip.stream().<Expression>map(label -> {
                 Attribute resolved = find(plan.output(), label);
                 return resolved != null ? resolved : mapToRef(label);
@@ -379,6 +449,10 @@ public record TranslationContext(
             Alias packing = new Alias(source, mapOpen(skip), new TimeSeriesWithout(source, excluded));
             groupKeys.add(packing);
             outKeys.add(packing.toAttribute());
+            if (finestPacking == null) {
+                finest = skip;
+                finestPacking = packing.toAttribute();
+            }
         }
         for (String label : schema.labels()) {
             Attribute carrier = find(plan.output(), label);
@@ -388,7 +462,7 @@ public record TranslationContext(
             }
         }
 
-        return new TimeSeriesAggregate(
+        LogicalPlan collapse = new TimeSeriesAggregate(
             source,
             plan,
             groupings(stepBucketAlias, groupKeys),
@@ -398,6 +472,99 @@ public record TranslationContext(
             TimeSeriesAggregate.Origin.PROMQL_COMMAND,
             false
         );
+        return derived.isEmpty() ? collapse : new Eval(source, collapse, derived);
+    }
+
+    /**
+     * The canonical label container of every label of a finished table: its finest packing - every label but the ones the
+     * table leaves out - or no label at all, with each label column written over it, as a column can hold a value the
+     * packing does not (a relabel writes one) and a null column is an absent label.
+     */
+    public Expression labels(IntermediateResult table) {
+        Source source = cmd.source();
+        Set<String> finest = table.schema().finestSkip();
+        Expression labels = finest == null ? Literal.keyword(source, "{}") : canonical(table.packed(finest));
+        for (String label : table.schema().labels()) {
+            Attribute column = table.label(label);
+            Expression value = column == null ? new Literal(source, null, DataType.KEYWORD)
+                : DataType.isString(column.dataType()) ? column
+                : new ToString(source, column, configuration());
+            labels = new TimeSeriesMetadataSet(source, labels, Literal.keyword(source, label), value);
+        }
+        return labels;
+    }
+
+    /**
+     * A finished table over {@code plan}, whose labels are the label container {@code labels}: every label column {@code wanted}
+     * names reads its values out of it, and every packing leaves its labels out of it. The {@code promoted} labels, the ones
+     * a node declares as its own columns, stand beside the packing of every other label, which takes the place of a
+     * whole-label-set packing, so a label shows once.
+     */
+    public IntermediateResult fromLabels(
+        LogicalPlan plan,
+        Attribute labels,
+        TranslationSchema wanted,
+        Set<String> promoted,
+        Attribute value,
+        Attribute step
+    ) {
+        Source source = cmd.source();
+        var columns = new ArrayList<Alias>();
+        var skips = new LinkedHashSet<Set<String>>();
+        for (Set<String> skip : wanted.skips()) {
+            skips.add(skip.isEmpty() ? promoted : skip);
+        }
+        if (skips.isEmpty()) {
+            skips.add(promoted);
+        }
+        for (Set<String> skip : skips) {
+            columns.add(new Alias(source, mapOpen(skip), unset(labels, skip.stream())));
+        }
+        for (String label : wanted.labels()) {
+            columns.add(new Alias(source, label, new TimeSeriesMetadataPath(source, labels, Literal.keyword(source, label))));
+        }
+        LogicalPlan table = columns.isEmpty() ? plan : new Eval(source, plan, columns);
+        return new IntermediateResult(
+            table,
+            new TranslationSchema(wanted.labels(), skips),
+            value,
+            step,
+            null,
+            Kind.AFTER_INITIAL_AGGREGATE
+        );
+    }
+
+    /**
+     * {@code plan} failing the query where two of its series share a label set at a step, as Prometheus fails a result
+     * vector holding one label set twice. {@code labels} are the columns the label set reads from.
+     */
+    public static LogicalPlan uniqueSeries(Source source, LogicalPlan plan, Attribute step, List<Attribute> labels) {
+        // Binary, not keyword: a sort the optimizer pushes below the result's projection carries it along. Named apart from
+        // a join key packed below.
+        Attribute packed = PackDims.newPackedAttribute(
+            source,
+            TemporaryNameGenerator.locallyUniqueTemporaryName(PackDims.PACKED_FIELD_NAME)
+        );
+        var keys = new ArrayList<Attribute>(List.of(step));
+        keys.addAll(labels);
+        return new DistinctBy(source, new PackDims(source, plan, keys, packed), packed, true);
+    }
+
+    /**
+     * The double column {@code alias} defines, under its id even while its value is unresolved: an attribute taken from an
+     * unresolved alias is never bound again once a join or a projection holds it.
+     */
+    public static Attribute pinned(Alias alias) {
+        if (alias.resolved()) {
+            return alias.toAttribute();
+        }
+        return new ReferenceAttribute(alias.source(), null, alias.name(), DataType.DOUBLE, Nullability.TRUE, alias.id(), true);
+    }
+
+    /** {@code packing} leaving {@code labels} out as well: the canonical label container of the remaining labels. */
+    public static Expression unset(Expression packing, Stream<String> labels) {
+        List<Expression> names = labels.sorted().<Expression>map(label -> Literal.keyword(packing.source(), label)).toList();
+        return new TimeSeriesMetadataFilter(packing.source(), packing, names, true);
     }
 
     /**
@@ -598,9 +765,12 @@ public record TranslationContext(
         return aggregates;
     }
 
-    /** Flattens a left-associative top-level {@code or} chain into branches; branch 0 has the highest precedence. */
+    /**
+     * Flattens a left-associative top-level {@code or} chain into branches; branch 0 has the highest precedence. An {@code or}
+     * with matching modifiers matches on its own labels, so it is a branch of its own.
+     */
     private static void flattenUnion(LogicalPlan node, List<LogicalPlan> branches) {
-        if (node instanceof VectorBinarySet setOp && setOp.op() == VectorBinarySet.SetOp.UNION) {
+        if (node instanceof VectorBinarySet setOp && setOp.op() == VectorBinarySet.SetOp.UNION && setOp.match() == VectorMatch.NONE) {
             flattenUnion(setOp.left(), branches);
             flattenUnion(setOp.right(), branches);
         } else {
