@@ -35,6 +35,7 @@ import java.util.concurrent.TimeUnit;
 import static org.elasticsearch.xpack.encryption.ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY;
 import static org.elasticsearch.xpack.encryption.ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.notNullValue;
 
 /**
  * On stateless only master-eligible nodes persist cluster state, so only they must be able to wrap the cluster state encryption key.
@@ -96,7 +97,7 @@ public class StatelessEncryptionPasswordIT extends AbstractStatelessPluginIntegT
         startSearchNode();
         ensureStableCluster(4);
         applyClusterSecrets(1, ACTIVE_PASSWORD_ID_KEY, "v1", PASSWORD_PREFIX + "v1", "password-v1");
-        assertBusy(() -> assertThat(pek(masterState()).getPasswordId(), equalTo("v1")));
+        assertBusy(() -> assertThat(masterPek().getPasswordId(), equalTo("v1")));
 
         applyClusterSecrets(2, ACTIVE_PASSWORD_ID_KEY, "v2", PASSWORD_PREFIX + "v2", "password-v2");
         for (String node : internalCluster().getNodeNames()) {
@@ -105,7 +106,7 @@ public class StatelessEncryptionPasswordIT extends AbstractStatelessPluginIntegT
         }
         assertTrue(hasUsableKey(masterState()));
         // the key metadata follows the new password although the old one is gone
-        assertBusy(() -> assertThat(pek(masterState()).getPasswordId(), equalTo("v2")));
+        assertBusy(() -> assertThat(masterPek().getPasswordId(), equalTo("v2")));
 
         createIndex("index-after-password-change");
         ensureGreen("index-after-password-change");
@@ -170,7 +171,7 @@ public class StatelessEncryptionPasswordIT extends AbstractStatelessPluginIntegT
         assertBusy(() -> assertTrue(hasUsableKey(masterState())));
 
         internalCluster().restartNode(master);
-        assertBusy(() -> assertTrue(pek(masterState()).isUnwrapFailed()));
+        assertBusy(() -> assertTrue(masterPek().isUnwrapFailed()));
 
         reload(master, passwordSettings("v1", "password-v1"));
         assertBusy(() -> assertTrue(hasUsableKey(masterState())));
@@ -200,6 +201,12 @@ public class StatelessEncryptionPasswordIT extends AbstractStatelessPluginIntegT
 
     private static ProjectEncryptionKeyMetadata pek(ClusterState state) {
         return state.metadata().getSingleProjectCustom(ProjectEncryptionKeyMetadata.TYPE);
+    }
+
+    private static ProjectEncryptionKeyMetadata masterPek() {
+        ProjectEncryptionKeyMetadata metadata = pek(masterState());
+        assertThat(metadata, notNullValue());
+        return metadata;
     }
 
     private static boolean hasUsableKey(ClusterState state) {
