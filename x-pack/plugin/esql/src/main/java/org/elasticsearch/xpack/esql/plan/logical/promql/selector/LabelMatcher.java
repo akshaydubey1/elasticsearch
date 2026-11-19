@@ -10,9 +10,9 @@ package org.elasticsearch.xpack.esql.plan.logical.promql.selector;
 import org.apache.lucene.util.automaton.Automata;
 import org.apache.lucene.util.automaton.Automaton;
 import org.apache.lucene.util.automaton.Operations;
-import org.apache.lucene.util.automaton.RegExp;
 import org.elasticsearch.lucene.util.automaton.MinimizationOperations;
-import org.elasticsearch.xpack.esql.core.QlIllegalArgumentException;
+import org.elasticsearch.xpack.esql.core.InvalidArgumentException;
+import org.elasticsearch.xpack.esql.core.expression.predicate.regex.Re2Pattern;
 import org.elasticsearch.xpack.esql.core.tree.Node;
 import org.elasticsearch.xpack.esql.core.tree.NodeStringMapper;
 import org.elasticsearch.xpack.esql.core.tree.NodeStringRenderable;
@@ -132,16 +132,12 @@ public class LabelMatcher implements NodeStringRenderable {
             result = Operations.union(automata);
         } else if (isMultiValue()) {
             // Multi-value regex: union of all regex patterns
-            List<Automaton> automata = values.stream().map(v -> new RegExp(v).toAutomaton()).toList();
+            List<Automaton> automata = values.stream().map(LabelMatcher::regexAutomaton).toList();
             result = Operations.union(automata);
         } else {
             // Single value
             String v = getFirstValue();
-            try {
-                result = matcher.isRegex() ? new RegExp(v).toAutomaton() : Automata.makeString(v);
-            } catch (IllegalArgumentException ex) {
-                throw new QlIllegalArgumentException(ex, "Cannot parse regex {}", v);
-            }
+            result = matcher.isRegex() ? regexAutomaton(v) : Automata.makeString(v);
         }
         result = MinimizationOperations.minimize(result, Operations.DEFAULT_DETERMINIZE_WORK_LIMIT);
         // negate if needed
@@ -150,6 +146,22 @@ public class LabelMatcher implements NodeStringRenderable {
         }
         automaton = result;
         return automaton;
+    }
+
+    /**
+     * A PromQL regex, in RE2 syntax, used for both the matcher's automaton and the filter so the two agree on what it
+     * matches.
+     */
+    public static Re2Pattern regex(String regex) {
+        return new Re2Pattern(regex);
+    }
+
+    private static Automaton regexAutomaton(String regex) {
+        try {
+            return regex(regex).createAutomaton(false);
+        } catch (IllegalArgumentException e) {
+            throw new InvalidArgumentException(e, "Invalid regular expression [{}]: {}", regex, e.getMessage());
+        }
     }
 
     public boolean matchesAll() {
