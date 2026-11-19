@@ -33,6 +33,7 @@ import org.elasticsearch.logging.LogManager;
 import org.elasticsearch.logging.Logger;
 import org.elasticsearch.tasks.CancellableTask;
 import org.elasticsearch.tasks.Task;
+import org.elasticsearch.tasks.TaskId;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.transport.RemoteClusterService;
 import org.elasticsearch.transport.TransportService;
@@ -234,6 +235,7 @@ public class TransportEsqlStreamQueryAction extends TransportAction<EsqlStreamQu
         ActionListener<ActionResponse.Empty> listener = computeService.coordinate(task, streamListener);
         EsqlFlags flags = computeService.createFlags();
         String sessionId = getOrCreateSessionID(task);
+        TaskId taskId = new TaskId(clusterService.localNode().getId(), task.getId());
         AtomicBoolean streamStarted = new AtomicBoolean(false);
         AtomicBoolean outputRunSeen = new AtomicBoolean(false);
         // Set just before this action hands the publisher its end (the footer or a failure), so the close listener below can
@@ -308,7 +310,8 @@ public class TransportEsqlStreamQueryAction extends TransportAction<EsqlStreamQu
                             streamStarted,
                             columns,
                             nullColumns,
-                            QuerySettings.TIME_ZONE.get(configuration.resolvedSettings())
+                            QuerySettings.TIME_ZONE.get(configuration.resolvedSettings()),
+                            taskId
                         );
                         if (startFailure != null) {
                             resultListener.onFailure(startFailure);
@@ -402,7 +405,8 @@ public class TransportEsqlStreamQueryAction extends TransportAction<EsqlStreamQu
                         streamStarted,
                         columns,
                         request.dropNullColumns() ? new boolean[columns.size()] : null,
-                        QuerySettings.TIME_ZONE.get(result.configuration().resolvedSettings())
+                        QuerySettings.TIME_ZONE.get(result.configuration().resolvedSettings()),
+                        taskId
                     );
                     if (startFailure != null) {
                         listener.onFailure(startFailure);
@@ -471,9 +475,10 @@ public class TransportEsqlStreamQueryAction extends TransportAction<EsqlStreamQu
         AtomicBoolean streamStarted,
         List<ColumnInfoImpl> columns,
         boolean[] nullColumns,
-        ZoneId zoneId
+        ZoneId zoneId,
+        TaskId taskId
     ) {
-        request.resultStreamListener().onResponse(new EsqlStreamQueryAction.ResultStream(columns, publisher, nullColumns, zoneId));
+        request.resultStreamListener().onResponse(new EsqlStreamQueryAction.ResultStream(columns, publisher, nullColumns, zoneId, taskId));
         Exception startFailure = publisher.failure();
         if (startFailure != null) {
             return startFailure;

@@ -13,6 +13,7 @@ import org.elasticsearch.ElasticsearchSecurityException;
 import org.elasticsearch.ElasticsearchStatusException;
 import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.common.UUIDs;
 import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.bytes.CompositeBytesReference;
 import org.elasticsearch.common.bytes.ReleasableBytesReference;
@@ -28,10 +29,13 @@ import org.elasticsearch.compute.data.BytesRefBlock;
 import org.elasticsearch.compute.data.LongBlock;
 import org.elasticsearch.compute.data.Page;
 import org.elasticsearch.compute.operator.PageStreamPublisher;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.rest.AbstractRestChannel;
 import org.elasticsearch.rest.ChunkedRestResponseBodyPart;
 import org.elasticsearch.rest.RestResponse;
 import org.elasticsearch.rest.RestStatus;
+import org.elasticsearch.tasks.TaskCancelledException;
+import org.elasticsearch.tasks.TaskId;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.test.rest.FakeRestChannel;
 import org.elasticsearch.test.rest.FakeRestRequest;
@@ -41,15 +45,20 @@ import org.elasticsearch.xcontent.NamedXContentRegistry;
 import org.elasticsearch.xcontent.ToXContent;
 import org.elasticsearch.xcontent.XContentParserConfiguration;
 import org.elasticsearch.xcontent.json.JsonXContent;
+import org.elasticsearch.xpack.core.esql.action.ColumnInfo;
 import org.elasticsearch.xpack.esql.core.type.DataType;
+import org.elasticsearch.xpack.esql.streaming.StreamMetadata;
 import org.junit.After;
 import org.junit.Before;
 
 import java.io.IOException;
+import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -671,7 +680,7 @@ public class EsqlStreamResponseListenerTests extends ESTestCase {
         EsqlStreamResponseListener listener = new EsqlStreamResponseListener(channel, new ThreadContext(Settings.EMPTY));
 
         listener.resultStreamListener()
-            .onResponse(new EsqlStreamQueryAction.ResultStream(simpleColumns(), publisher, null, ZoneOffset.UTC));
+            .onResponse(new EsqlStreamQueryAction.ResultStream(simpleColumns(), publisher, null, ZoneOffset.UTC, TaskId.EMPTY_TASK_ID));
         assertThat("no response before the first page", channel.okResponses, equalTo(0));
         assertThat(channel.errorResponses, equalTo(0));
         assertTrue("publisher should be unblocked after early demand", publisher.waitForWriting().listener().isDone());
@@ -693,7 +702,7 @@ public class EsqlStreamResponseListenerTests extends ESTestCase {
         EsqlStreamResponseListener listener = new EsqlStreamResponseListener(channel, new ThreadContext(Settings.EMPTY));
 
         listener.resultStreamListener()
-            .onResponse(new EsqlStreamQueryAction.ResultStream(simpleColumns(), publisher, null, ZoneOffset.UTC));
+            .onResponse(new EsqlStreamQueryAction.ResultStream(simpleColumns(), publisher, null, ZoneOffset.UTC, TaskId.EMPTY_TASK_ID));
         assertThat("no 200 OK before the first page", channel.okAttempts, equalTo(0));
 
         producer.addPage(buildSimplePage(1, "first"));
@@ -751,6 +760,105 @@ public class EsqlStreamResponseListenerTests extends ESTestCase {
         }
     }
 
+    private static class RecordingStreamWriter implements PersistentStreamWriter {
+        private final List<Integer> storedSeqs = new ArrayList<>();
+        private final Deque<Runnable> heldCapacity = new ArrayDeque<>();
+        private boolean holdCapacity;
+        private int terminalCalls;
+        private StreamMetadata metadata;
+        private String status = "RUNNING";
+        private long completedPages;
+        private long completedRows;
+        private Exception failure;
+
+        void holdCapacity() {
+            holdCapacity = true;
+        }
+
+        void releaseCapacity() {
+            heldCapacity.removeFirst().run();
+        }
+
+        @Override
+        public String createStarted(
+            TaskId taskId,
+            @Nullable Instant expiration,
+            List<ColumnInfo> columns,
+            Map<String, String> headers,
+            List<String> warnings
+        ) {
+            assertNull("the stream was started twice", metadata);
+            metadata = StreamMetadata.started(UUIDs.randomBase64UUID(), taskId, expiration, columns, headers, warnings);
+            return metadata.streamId();
+        }
+
+        @Override
+        public void appendPage(int seq, Page page, Runnable onCapacity) {
+            storedSeqs.add(seq);
+            if (holdCapacity) {
+                heldCapacity.addLast(onCapacity);
+            } else {
+                onCapacity.run();
+            }
+        }
+
+        @Override
+        public void markComplete(boolean partial, long tookMillis, long pages, long rows) {
+            terminalCalls++;
+            metadata = metadata.complete(partial, tookMillis, pages, rows);
+            status = "COMPLETE";
+            completedPages = pages;
+            completedRows = rows;
+        }
+
+        @Override
+        public void markFailed(boolean partial, long tookMillis, Exception e) {
+            terminalCalls++;
+            metadata = metadata.failed(partial, tookMillis, e);
+            status = "FAILED";
+            failure = e;
+        }
+
+        @Override
+        public void markCanceled() {
+            terminalCalls++;
+            metadata = metadata.canceled();
+            status = "CANCELED";
+        }
+
+        StreamMetadata metadata() {
+            return metadata;
+        }
+
+        String streamId() {
+            return metadata.streamId();
+        }
+
+        String status() {
+            return status;
+        }
+
+        List<Integer> storedSeqs() {
+            return storedSeqs;
+        }
+
+        int terminalCalls() {
+            return terminalCalls;
+        }
+
+        long completedPages() {
+            return completedPages;
+        }
+
+        long completedRows() {
+            return completedRows;
+        }
+
+        String failureType() {
+            return ElasticsearchException.getExceptionName(ExceptionsHelper.unwrapCause(failure));
+        }
+    }
+
     private record Subscribed(
         PageStreamPublisher publisher,
         PageStreamPublisher.Producer producer,
@@ -776,11 +884,26 @@ public class EsqlStreamResponseListenerTests extends ESTestCase {
     }
 
     private Subscribed subscribe(List<ColumnInfoImpl> columns, boolean[] nullColumns, ZoneId zoneId, StreamOptions options) {
+        return subscribe(columns, nullColumns, zoneId, options, PersistentStreamWriter.NOOP);
+    }
+
+    private Subscribed subscribe(StreamOptions options, PersistentStreamWriter writer) {
+        return subscribe(simpleColumns(), null, ZoneOffset.UTC, options, writer);
+    }
+
+    private Subscribed subscribe(
+        List<ColumnInfoImpl> columns,
+        boolean[] nullColumns,
+        ZoneId zoneId,
+        StreamOptions options,
+        PersistentStreamWriter writer
+    ) {
         PageStreamPublisher publisher = new PageStreamPublisher();
         PageStreamPublisher.Producer producer = publisher.registerProducer();
         FakeRestChannel channel = new FakeRestChannel(new FakeRestRequest(), true);
-        EsqlStreamResponseListener listener = new EsqlStreamResponseListener(channel, new ThreadContext(Settings.EMPTY), options);
-        listener.resultStreamListener().onResponse(new EsqlStreamQueryAction.ResultStream(columns, publisher, nullColumns, zoneId));
+        EsqlStreamResponseListener listener = new EsqlStreamResponseListener(channel, new ThreadContext(Settings.EMPTY), writer, options);
+        listener.resultStreamListener()
+            .onResponse(new EsqlStreamQueryAction.ResultStream(columns, publisher, nullColumns, zoneId, TaskId.EMPTY_TASK_ID));
         return new Subscribed(publisher, producer, channel, listener);
     }
 
@@ -958,6 +1081,317 @@ public class EsqlStreamResponseListenerTests extends ESTestCase {
             rows.get(0).get(0),
             equalTo("2025-05-31T02:00:00.123456789+02:00")
         );
+    }
+
+    private static final String STREAM_ID_HEADER = "X-ElasticSearch-Stream-Id";
+
+    private static StreamOptions storing(StreamOptions.Store store, long maxRows, long maxBytes) {
+        return new StreamOptions(store, maxRows, maxBytes);
+    }
+
+    private void completeStream(Subscribed s) {
+        s.producer().finish();
+        s.publisher().completeWithFooter(5L, List.of(), false);
+    }
+
+    private void addPages(Subscribed s, int... rowsPerPage) {
+        for (int rows : rowsPerPage) {
+            s.producer().addPage(buildLargePage(rows, 1));
+        }
+    }
+
+    private void finishAfterLimit(Subscribed s, int... rowsPerPage) {
+        s.response().close();
+        assertFalse("the query keeps running after the response is released", s.publisher().isClosed());
+        addPages(s, rowsPerPage);
+        completeStream(s);
+    }
+
+    private static void assertCompleted(RecordingStreamWriter writer, long pages, long rows) {
+        assertThat(writer.status(), equalTo("COMPLETE"));
+        assertThat(writer.completedPages(), equalTo(pages));
+        assertThat(writer.completedRows(), equalTo(rows));
+        assertThat("a stream gets exactly one terminal call", writer.terminalCalls(), equalTo(1));
+    }
+
+    public void testNoneNeverTouchesTheWriter() throws IOException {
+        RecordingStreamWriter writer = new RecordingStreamWriter();
+        Subscribed s = subscribe(StreamOptions.NONE, writer);
+        drainStream(s, List.of(buildLargePage(2, 1)), 5L, List.of());
+
+        assertNull(writer.metadata());
+        assertThat(writer.storedSeqs(), equalTo(List.of()));
+        assertThat(s.response().getHeaders(), not(hasKey(STREAM_ID_HEADER)));
+    }
+
+    public void testAllStoresEveryPage() throws IOException {
+        RecordingStreamWriter writer = new RecordingStreamWriter();
+        Subscribed s = subscribe(storing(StreamOptions.Store.ALL, StreamOptions.NO_LIMIT, StreamOptions.NO_LIMIT), writer);
+        Drained drained = drainStream(s, List.of(buildLargePage(2, 1), buildLargePage(2, 1), buildLargePage(2, 1)), 5L, List.of());
+
+        assertThat(drained.footer().get("complete"), equalTo(true));
+        assertThat(writer.storedSeqs(), equalTo(List.of(0, 1, 2)));
+        assertCompleted(writer, 3, 6);
+    }
+
+    public void testAllLimitInsideAPage() throws IOException {
+        RecordingStreamWriter writer = new RecordingStreamWriter();
+        Subscribed s = subscribe(storing(StreamOptions.Store.ALL, 3, StreamOptions.NO_LIMIT), writer);
+        ChunkedRestResponseBodyPart pagePart = sendFirstPage(s, buildLargePage(5, 1));
+        assertThat(decodeRows(pagePart).size(), equalTo(3));
+        assertLimitFooter(decodeLine(nextPart(pagePart, () -> {})), 3);
+        assertThat(writer.storedSeqs(), equalTo(List.of(0)));
+
+        finishAfterLimit(s, 2, 2);
+
+        assertThat(writer.storedSeqs(), equalTo(List.of(0, 1, 2)));
+        assertCompleted(writer, 3, 9);
+    }
+
+    public void testAllLimitOnAPageBoundary() throws IOException {
+        RecordingStreamWriter writer = new RecordingStreamWriter();
+        Subscribed s = subscribe(storing(StreamOptions.Store.ALL, 2, StreamOptions.NO_LIMIT), writer);
+        ChunkedRestResponseBodyPart pagePart = sendFirstPage(s, buildLargePage(2, 1));
+        assertThat(decodeRows(pagePart).size(), equalTo(2));
+        ChunkedRestResponseBodyPart footerPart = nextPart(pagePart, () -> s.producer().addPage(buildLargePage(2, 1)));
+        assertLimitFooter(decodeLine(footerPart), 2);
+        assertThat(writer.storedSeqs(), equalTo(List.of(0, 1)));
+
+        finishAfterLimit(s, 2);
+
+        assertThat(writer.storedSeqs(), equalTo(List.of(0, 1, 2)));
+        assertCompleted(writer, 3, 6);
+    }
+
+    public void testAllExactFit() throws IOException {
+        RecordingStreamWriter writer = new RecordingStreamWriter();
+        Subscribed s = subscribe(storing(StreamOptions.Store.ALL, 4, StreamOptions.NO_LIMIT), writer);
+        Drained drained = drainStream(s, List.of(buildLargePage(2, 1), buildLargePage(2, 1)), 5L, List.of());
+
+        assertThat(drained.footer().get("complete"), equalTo(true));
+        assertThat(writer.storedSeqs(), equalTo(List.of(0, 1)));
+        assertCompleted(writer, 2, 4);
+    }
+
+    public void testOverflowWithoutLimitStoresNothing() throws IOException {
+        RecordingStreamWriter writer = new RecordingStreamWriter();
+        Subscribed s = subscribe(storing(StreamOptions.Store.OVERFLOW, StreamOptions.NO_LIMIT, StreamOptions.NO_LIMIT), writer);
+        Drained drained = drainStream(s, List.of(buildLargePage(2, 1), buildLargePage(2, 1)), 5L, List.of());
+
+        assertThat(drained.footer().get("complete"), equalTo(true));
+        assertThat(writer.storedSeqs(), equalTo(List.of()));
+        assertThat(s.response().getHeaders().get(STREAM_ID_HEADER), equalTo(List.of(writer.streamId())));
+        assertCompleted(writer, 2, 4);
+    }
+
+    public void testOverflowLimitInsideAPage() throws IOException {
+        RecordingStreamWriter writer = new RecordingStreamWriter();
+        Subscribed s = subscribe(storing(StreamOptions.Store.OVERFLOW, 3, StreamOptions.NO_LIMIT), writer);
+        ChunkedRestResponseBodyPart first = sendFirstPage(s, buildLargePage(2, 1));
+        assertThat(decodeRows(first).size(), equalTo(2));
+        assertThat("a page that was sent completely is not stored", writer.storedSeqs(), equalTo(List.of()));
+        ChunkedRestResponseBodyPart second = nextPart(first, () -> s.producer().addPage(buildLargePage(2, 1)));
+        assertThat(decodeRows(second).size(), equalTo(1));
+        assertLimitFooter(decodeLine(nextPart(second, () -> {})), 3);
+        assertThat("a page that was sent partially is stored whole", writer.storedSeqs(), equalTo(List.of(1)));
+
+        finishAfterLimit(s, 2);
+
+        assertThat(writer.storedSeqs(), equalTo(List.of(1, 2)));
+        assertCompleted(writer, 3, 6);
+    }
+
+    public void testOverflowLimitOnAPageBoundary() throws IOException {
+        RecordingStreamWriter writer = new RecordingStreamWriter();
+        Subscribed s = subscribe(storing(StreamOptions.Store.OVERFLOW, 2, StreamOptions.NO_LIMIT), writer);
+        ChunkedRestResponseBodyPart pagePart = sendFirstPage(s, buildLargePage(2, 1));
+        assertThat(decodeRows(pagePart).size(), equalTo(2));
+        ChunkedRestResponseBodyPart footerPart = nextPart(pagePart, () -> s.producer().addPage(buildLargePage(2, 1)));
+        assertLimitFooter(decodeLine(footerPart), 2);
+        assertThat(writer.storedSeqs(), equalTo(List.of(1)));
+
+        finishAfterLimit(s, 2);
+
+        assertThat(writer.storedSeqs(), equalTo(List.of(1, 2)));
+        assertCompleted(writer, 3, 6);
+    }
+
+    public void testOverflowExactFit() throws IOException {
+        RecordingStreamWriter writer = new RecordingStreamWriter();
+        Subscribed s = subscribe(storing(StreamOptions.Store.OVERFLOW, 4, StreamOptions.NO_LIMIT), writer);
+        Drained drained = drainStream(s, List.of(buildLargePage(2, 1), buildLargePage(2, 1)), 5L, List.of());
+
+        assertThat(drained.footer().get("complete"), equalTo(true));
+        assertThat(writer.storedSeqs(), equalTo(List.of()));
+        assertCompleted(writer, 2, 4);
+    }
+
+    public void testOverflowByteLimitInsideAPage() throws IOException {
+        RecordingStreamWriter writer = new RecordingStreamWriter();
+        long maxBytes = columnsLineBytes() + 2 * ROW_LINE_BYTES;
+        Subscribed s = subscribe(storing(StreamOptions.Store.OVERFLOW, StreamOptions.NO_LIMIT, maxBytes), writer);
+        ChunkedRestResponseBodyPart pagePart = sendFirstPage(s, buildLargePage(5, 1));
+        assertThat(decodeRows(pagePart).size(), equalTo(2));
+        assertLimitFooter(decodeLine(nextPart(pagePart, () -> {})), 2);
+        assertThat(writer.storedSeqs(), equalTo(List.of(0)));
+
+        finishAfterLimit(s, 5);
+
+        assertThat(writer.storedSeqs(), equalTo(List.of(0, 1)));
+        assertCompleted(writer, 2, 10);
+    }
+
+    public void testOverflowMaxRowsZero() throws IOException {
+        RecordingStreamWriter writer = new RecordingStreamWriter();
+        Subscribed s = subscribe(storing(StreamOptions.Store.OVERFLOW, 0, StreamOptions.NO_LIMIT), writer);
+        s.producer().addPage(buildLargePage(2, 1));
+        ChunkedRestResponseBodyPart columnsPart = s.response().chunkedContent();
+        encodeBodyPart(columnsPart);
+        assertLimitFooter(decodeLine(nextPart(columnsPart, () -> {})), 0);
+        assertThat(writer.storedSeqs(), equalTo(List.of(0)));
+
+        finishAfterLimit(s, 2);
+
+        assertThat(writer.storedSeqs(), equalTo(List.of(0, 1)));
+        assertCompleted(writer, 2, 4);
+    }
+
+    public void testClosingTheResponseDoesNotCancelTheQuery() throws IOException {
+        RecordingStreamWriter writer = new RecordingStreamWriter();
+        Subscribed s = subscribe(storing(StreamOptions.Store.ALL, 1, StreamOptions.NO_LIMIT), writer);
+        ChunkedRestResponseBodyPart pagePart = sendFirstPage(s, buildLargePage(3, 1));
+        assertThat(decodeRows(pagePart).size(), equalTo(1));
+        decodeLine(nextPart(pagePart, () -> {}));
+        s.response().close();
+        assertFalse("releasing the response does not stop a query whose pages are stored", s.publisher().isClosed());
+
+        addPages(s, 2);
+        assertThat(writer.storedSeqs(), equalTo(List.of(0, 1)));
+        completeStream(s);
+
+        assertTrue(s.publisher().isClosed());
+        assertCompleted(writer, 2, 5);
+    }
+
+    public void testDisconnectInTheMiddleOfAPageStoresThePage() throws IOException {
+        RecordingStreamWriter writer = new RecordingStreamWriter();
+        Subscribed s = subscribe(storing(StreamOptions.Store.OVERFLOW, StreamOptions.NO_LIMIT, StreamOptions.NO_LIMIT), writer);
+        s.producer().addPage(buildLargePage(5, 1));
+        ChunkedRestResponseBodyPart columnsPart = s.response().chunkedContent();
+        encodeBodyPart(columnsPart);
+        ChunkedRestResponseBodyPart pagePart = nextPart(columnsPart, () -> {});
+        pagePart.encodeChunk(1, BytesRefRecycler.NON_RECYCLING_INSTANCE);
+        assertFalse(pagePart.isPartComplete());
+        assertThat(writer.storedSeqs(), equalTo(List.of()));
+
+        s.response().close();
+
+        assertThat(writer.storedSeqs(), equalTo(List.of(0)));
+        assertFalse(s.publisher().isClosed());
+        addPages(s, 2);
+        completeStream(s);
+        assertThat(writer.storedSeqs(), equalTo(List.of(0, 1)));
+        assertCompleted(writer, 2, 7);
+    }
+
+    public void testFailureAfterTheLimitIsRecorded() throws IOException {
+        RecordingStreamWriter writer = new RecordingStreamWriter();
+        Subscribed s = subscribe(storing(StreamOptions.Store.ALL, 2, StreamOptions.NO_LIMIT), writer);
+        ChunkedRestResponseBodyPart pagePart = sendFirstPage(s, buildLargePage(2, 1));
+        assertThat(decodeRows(pagePart).size(), equalTo(2));
+        ChunkedRestResponseBodyPart footerPart = nextPart(pagePart, () -> s.producer().addPage(buildLargePage(2, 1)));
+        assertLimitFooter(decodeLine(footerPart), 2);
+        s.response().close();
+
+        s.publisher().failStream(new RuntimeException("boom"));
+
+        assertThat(writer.status(), equalTo("FAILED"));
+        assertThat(writer.failureType(), equalTo("runtime_exception"));
+        assertThat(writer.terminalCalls(), equalTo(1));
+        assertThat(writer.storedSeqs(), equalTo(List.of(0, 1)));
+    }
+
+    public void testFailureBeforeTheFirstPageIsRecorded() {
+        RecordingStreamWriter writer = new RecordingStreamWriter();
+        Subscribed s = subscribe(storing(StreamOptions.Store.ALL, StreamOptions.NO_LIMIT, StreamOptions.NO_LIMIT), writer);
+
+        s.publisher().failStream(new ElasticsearchStatusException("not allowed", RestStatus.FORBIDDEN));
+
+        assertThat(s.response().status(), equalTo(RestStatus.FORBIDDEN));
+        assertThat(writer.status(), equalTo("FAILED"));
+        assertThat(writer.failureType(), equalTo("status_exception"));
+        assertThat(writer.terminalCalls(), equalTo(1));
+        assertThat(writer.storedSeqs(), equalTo(List.of()));
+    }
+
+    public void testTaskCancellationIsRecordedAsCanceled() {
+        RecordingStreamWriter writer = new RecordingStreamWriter();
+        Subscribed s = subscribe(storing(StreamOptions.Store.ALL, StreamOptions.NO_LIMIT, StreamOptions.NO_LIMIT), writer);
+
+        s.publisher().failStream(new TaskCancelledException("cancelled"));
+
+        assertThat(writer.status(), equalTo("CANCELED"));
+        assertThat(writer.terminalCalls(), equalTo(1));
+    }
+
+    public void testWriterCapacityGatesTheStoringOfSkippedPages() throws IOException {
+        RecordingStreamWriter writer = new RecordingStreamWriter();
+        writer.holdCapacity();
+        Subscribed s = subscribe(storing(StreamOptions.Store.ALL, 1, StreamOptions.NO_LIMIT), writer);
+        ChunkedRestResponseBodyPart pagePart = sendFirstPage(s, buildLargePage(3, 1));
+        assertThat(decodeRows(pagePart).size(), equalTo(1));
+        decodeLine(nextPart(pagePart, () -> {}));
+        s.response().close();
+        assertThat(writer.storedSeqs(), equalTo(List.of(0)));
+
+        addPages(s, 2, 2);
+        assertThat("no page is requested while the writer has no capacity", writer.storedSeqs(), equalTo(List.of(0)));
+        writer.releaseCapacity();
+        assertThat(writer.storedSeqs(), equalTo(List.of(0, 1)));
+        writer.releaseCapacity();
+        assertThat(writer.storedSeqs(), equalTo(List.of(0, 1, 2)));
+
+        completeStream(s);
+        assertThat("the end of the stream is only requested once the writer has capacity", writer.status(), equalTo("RUNNING"));
+        writer.releaseCapacity();
+        assertCompleted(writer, 3, 7);
+    }
+
+    public void testWriterCapacityGatesTheClient() throws IOException {
+        RecordingStreamWriter writer = new RecordingStreamWriter();
+        writer.holdCapacity();
+        Subscribed s = subscribe(storing(StreamOptions.Store.ALL, StreamOptions.NO_LIMIT, StreamOptions.NO_LIMIT), writer);
+        ChunkedRestResponseBodyPart first = sendFirstPage(s, buildLargePage(2, 1));
+        assertThat(decodeRows(first).size(), equalTo(2));
+        assertThat(writer.storedSeqs(), equalTo(List.of(0)));
+
+        AtomicReference<ChunkedRestResponseBodyPart> second = new AtomicReference<>();
+        first.getNextPart(ActionListener.wrap(second::set, e -> fail("unexpected failure: " + e)));
+        addPages(s, 2);
+        assertNull("the next page is not requested while the writer has no capacity", second.get());
+        writer.releaseCapacity();
+        assertNotNull(second.get());
+        assertThat(decodeRows(second.get()).size(), equalTo(2));
+
+        AtomicReference<ChunkedRestResponseBodyPart> footer = new AtomicReference<>();
+        second.get().getNextPart(ActionListener.wrap(footer::set, e -> fail("unexpected failure: " + e)));
+        completeStream(s);
+        assertNull("the end of the stream is not requested while the writer has no capacity", footer.get());
+        writer.releaseCapacity();
+        assertNotNull(footer.get());
+        assertTrue(footer.get().isLastPart());
+        assertThat(writer.storedSeqs(), equalTo(List.of(0, 1)));
+        assertCompleted(writer, 2, 4);
+    }
+
+    public void testStreamIdHeaderAndStartMetadata() throws IOException {
+        RecordingStreamWriter writer = new RecordingStreamWriter();
+        Subscribed s = subscribe(storing(StreamOptions.Store.OVERFLOW, StreamOptions.NO_LIMIT, StreamOptions.NO_LIMIT), writer);
+        drainStream(s, List.of(), 5L, List.of());
+
+        assertThat(s.response().getHeaders().get(STREAM_ID_HEADER), equalTo(List.of(writer.streamId())));
+        assertThat(writer.metadata().taskId(), equalTo(TaskId.EMPTY_TASK_ID));
+        assertThat(writer.metadata().columns().stream().map(ColumnInfo::name).toList(), equalTo(List.of("id", "name")));
     }
 
     private static List<ColumnInfoImpl> simpleColumns() {

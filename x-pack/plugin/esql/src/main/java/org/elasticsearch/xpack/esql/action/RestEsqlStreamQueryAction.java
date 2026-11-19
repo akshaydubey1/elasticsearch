@@ -8,6 +8,7 @@
 package org.elasticsearch.xpack.esql.action;
 
 import org.elasticsearch.Build;
+import org.elasticsearch.client.internal.Client;
 import org.elasticsearch.client.internal.node.NodeClient;
 import org.elasticsearch.logging.LogManager;
 import org.elasticsearch.logging.Logger;
@@ -33,9 +34,10 @@ import static org.elasticsearch.xpack.esql.formatter.TextFormat.URL_PARAM_HEADER
  * as it is produced, one row per line. See {@link EsqlStreamResponseListener} for the response shape.
  *
  * <p>The body is the same as for {@code POST /_query}, except that {@code columnar} is not supported, plus three fields
- * that only this API has: {@code max_rows} and {@code max_bytes}, which end the response early, and {@code store}, where
- * only {@code none} is supported. The query runs only for as long as the response is open: a disconnect cancels it, and
- * so does a response that ends at a limit.</p>
+ * that only this API has: {@code max_rows} and {@code max_bytes}, which end the response early, and {@code store}, which
+ * picks the pages that are persisted ({@code none}, {@code overflow} or {@code all}). With {@code store: none} the query runs
+ * only for as long as the response is open: a disconnect cancels it, and so does a response that ends at a limit. With any
+ * other store the query runs on, and only the task cancel API stops it.</p>
  */
 @ServerlessScope(Scope.PUBLIC)
 public class RestEsqlStreamQueryAction extends BaseRestHandler {
@@ -109,6 +111,7 @@ public class RestEsqlStreamQueryAction extends BaseRestHandler {
             EsqlStreamResponseListener restListener = new EsqlStreamResponseListener(
                 channel,
                 client.threadPool().getThreadContext(),
+                PersistentStreamWriter.NOOP,
                 options
             );
             EsqlStreamQueryRequest streamRequest = new EsqlStreamQueryRequest(
@@ -117,11 +120,10 @@ public class RestEsqlStreamQueryAction extends BaseRestHandler {
                 request.paramAsBoolean(EsqlQueryResponse.DROP_NULL_COLUMNS_OPTION, false),
                 restListener::setPreHeaderFailureFooter
             );
-            new RestCancellableNodeClient(client, request.getHttpChannel()).execute(
-                EsqlStreamQueryAction.INSTANCE,
-                streamRequest,
-                restListener
-            );
+            Client executingClient = options.store() == StreamOptions.Store.NONE
+                ? new RestCancellableNodeClient(client, request.getHttpChannel())
+                : client;
+            executingClient.execute(EsqlStreamQueryAction.INSTANCE, streamRequest, restListener);
         };
     }
 

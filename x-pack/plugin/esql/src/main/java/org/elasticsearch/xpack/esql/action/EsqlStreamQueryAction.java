@@ -10,6 +10,7 @@ package org.elasticsearch.xpack.esql.action;
 import org.elasticsearch.action.ActionResponse;
 import org.elasticsearch.action.ActionType;
 import org.elasticsearch.compute.operator.PageStreamPublisher;
+import org.elasticsearch.tasks.TaskId;
 
 import java.time.ZoneId;
 import java.util.List;
@@ -40,9 +41,15 @@ public class EsqlStreamQueryAction extends ActionType<ActionResponse.Empty> {
      * to start. Carries the schema, null-column mask, and time zone needed to render the first
      * NDJSON line (the columns header), plus the {@link PageStreamPublisher} that carries every
      * subsequent page and the terminal footer. The publisher's lifetime spans the entire query, so
-     * this record is a handle to the full result stream, not merely a start-moment signal. All four
+     * this record is a handle to the full result stream, not merely a start-moment signal. All
      * fields are signalled through {@link EsqlStreamQueryRequest#resultStreamListener()} rather than
      * through the transport action's own response path.
      */
-    public record ResultStream(List<ColumnInfoImpl> columns, PageStreamPublisher publisher, boolean[] nullColumns, ZoneId zoneId) {}
+    public record ResultStream(
+        List<ColumnInfoImpl> columns,
+        PageStreamPublisher publisher,
+        boolean[] nullColumns,
+        ZoneId zoneId,
+        TaskId taskId
+    ) {}
 }

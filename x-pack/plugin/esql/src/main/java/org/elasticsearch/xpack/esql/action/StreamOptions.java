@@ -14,17 +14,19 @@ import java.util.Locale;
 
 /**
  * How a {@code POST /_query/stream} response is bounded: the body fields {@code max_rows} and {@code max_bytes}.
- * A value of {@code -1} means no limit. Only {@code store: none} is supported, which is the behaviour of a response
- * that has no storage behind it.
+ * A value of {@code -1} means no limit. The {@code store} field picks which pages are persisted: none, only the ones the
+ * response did not send completely ({@code overflow}), or every page ({@code all}).
  *
- * @param store    where the response is kept
+ * @param store    which pages are persisted
  * @param maxRows  end the response after this many rows, or {@code -1}
  * @param maxBytes end the response after about this many bytes, checked between rows, or {@code -1}
  */
 record StreamOptions(Store store, long maxRows, long maxBytes) {
 
     enum Store {
-        NONE;
+        NONE,
+        OVERFLOW,
+        ALL;
 
         @Override
         public String toString() {

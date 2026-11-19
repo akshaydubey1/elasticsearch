@@ -29,9 +29,11 @@ import org.elasticsearch.rest.RestChannel;
 import org.elasticsearch.rest.RestController;
 import org.elasticsearch.rest.RestResponse;
 import org.elasticsearch.rest.RestStatus;
+import org.elasticsearch.tasks.TaskCancelledException;
 import org.elasticsearch.xcontent.ToXContent;
 import org.elasticsearch.xcontent.XContentBuilder;
 import org.elasticsearch.xcontent.XContentFactory;
+import org.elasticsearch.xpack.core.esql.action.ColumnInfo;
 import org.elasticsearch.xpack.esql.plugin.TransportEsqlStreamQueryAction;
 
 import java.io.IOException;
@@ -43,6 +45,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Flow;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
@@ -67,7 +70,7 @@ import static org.elasticsearch.ElasticsearchException.REST_EXCEPTION_SKIP_STACK
  *       the error HTTP status code.</li>
  *   <li>Last line (a limit was reached): {@code {"status":200,"took":N,"is_partial":false,"warnings":[...],
  *       "complete":false,"next_offset":N}}. The query did not finish, so there are no statistics, {@code _clusters}
- *       or profile. The query is cancelled when the response is released.</li>
+ *       or profile. With {@code store: none} the query is cancelled when the response is released.</li>
  * </ul>
  *
  * <p>{@code complete} is true only when the stream ended with a normal completion signal; any error, including
@@ -98,9 +101,13 @@ public class EsqlStreamResponseListener implements ActionListener<ActionResponse
     private static final Logger logger = LogManager.getLogger(EsqlStreamResponseListener.class);
     private static final String NDJSON_CONTENT_TYPE = "application/x-ndjson";
     private static final byte[] NEWLINE = "\n".getBytes(StandardCharsets.UTF_8);
+    private static final String STREAM_ID_HEADER = "X-ElasticSearch-Stream-Id";
 
     private final RestChannel channel;
     private final ThreadContext threadContext;
+    private final PersistentStreamWriter persistentStreamWriter;
+    private final StreamOptions options;
+
     private final long startNanos = System.nanoTime();
     private final AtomicBoolean terminalEmitted = new AtomicBoolean(false);
     private volatile boolean subscribed = false;
@@ -118,20 +125,143 @@ public class EsqlStreamResponseListener implements ActionListener<ActionResponse
     private final AtomicReference<Page> inFlightPage = new AtomicReference<>();
     private final AtomicLong rowsWritten = new AtomicLong();
     private final AtomicLong bytesWritten = new AtomicLong();
-    private final StreamOptions options;
+    private final AtomicInteger pagesSeen = new AtomicInteger();
+    private final AtomicLong rowsSeen = new AtomicLong();
+    private final AtomicBoolean draining = new AtomicBoolean(false);
+    private final Object capacityMonitor = new Object();
+    private boolean capacityAvailable = true;
+    private boolean pageRequested = false;
+    private final AtomicBoolean storeFinished = new AtomicBoolean(false);
+    private volatile String streamId;
+    private volatile int inFlightSeq;
+    private volatile boolean responseEnded = false;
     private volatile Supplier<ThreadContext.StoredContext> contextRestorer;
     private boolean responseSent = false;
 
     private volatile PageStreamPublisher.StreamFooter preHeaderFailureFooter;
 
     public EsqlStreamResponseListener(RestChannel channel, ThreadContext threadContext) {
-        this(channel, threadContext, StreamOptions.NONE);
+        this(channel, threadContext, PersistentStreamWriter.NOOP, StreamOptions.NONE);
     }
 
-    EsqlStreamResponseListener(RestChannel channel, ThreadContext threadContext, StreamOptions options) {
+    EsqlStreamResponseListener(
+        RestChannel channel,
+        ThreadContext threadContext,
+        PersistentStreamWriter persistentStreamWriter,
+        StreamOptions options
+    ) {
         this.channel = channel;
         this.threadContext = threadContext;
+        this.persistentStreamWriter = persistentStreamWriter;
         this.options = options;
+    }
+
+    private boolean stores() {
+        return options.store() != StreamOptions.Store.NONE;
+    }
+
+    private boolean shouldStore(boolean sentCompletely) {
+        return switch (options.store()) {
+            case NONE -> false;
+            case ALL -> true;
+            case OVERFLOW -> sentCompletely == false;
+        };
+    }
+
+    private int countPage(Page page) {
+        rowsSeen.addAndGet(page.getPositionCount());
+        return pagesSeen.getAndIncrement();
+    }
+
+    private void storePage(int seq, Page page) {
+        synchronized (capacityMonitor) {
+            capacityAvailable = false;
+        }
+        persistentStreamWriter.appendPage(seq, page, this::onStoreCapacity);
+    }
+
+    private void requestPage() {
+        synchronized (capacityMonitor) {
+            if (capacityAvailable == false) {
+                pageRequested = true;
+                return;
+            }
+        }
+        subscriber.subscription.request(1);
+    }
+
+    private void onStoreCapacity() {
+        boolean request;
+        synchronized (capacityMonitor) {
+            capacityAvailable = true;
+            request = pageRequested;
+            pageRequested = false;
+        }
+        if (request) {
+            subscriber.subscription.request(1);
+        }
+    }
+
+    private void finishPage(Page page, int seq, boolean sentCompletely) {
+        if (inFlightPage.compareAndSet(page, null) == false) {
+            return;
+        }
+        try {
+            if (shouldStore(sentCompletely)) {
+                storePage(seq, page);
+            }
+        } finally {
+            page.releaseBlocks();
+        }
+        if (sentCompletely == false) {
+            startDraining();
+        }
+    }
+
+    private void skipPage(Page page) {
+        int seq = countPage(page);
+        try {
+            if (stores()) {
+                storePage(seq, page);
+            }
+        } finally {
+            page.releaseBlocks();
+        }
+    }
+
+    private void startDraining() {
+        if (stores() == false) {
+            return;
+        }
+        responseEnded = true;
+        Flow.Subscription subscription = subscriber.subscription;
+        if (subscription != null && draining.compareAndSet(false, true)) {
+            requestPage();
+        }
+    }
+
+    private boolean claimStoreFinish() {
+        return stores() && storeFinished.compareAndSet(false, true);
+    }
+
+    private void completeStore(PageStreamPublisher.StreamFooter footer) {
+        if (claimStoreFinish()) {
+            persistentStreamWriter.markComplete(footer.isPartial(), footer.tookMillis(), pagesSeen.get(), rowsSeen.get());
+        }
+    }
+
+    private void failStore(Exception e) {
+        if (claimStoreFinish() == false) {
+            return;
+        }
+        if (ExceptionsHelper.unwrap(e, TaskCancelledException.class) != null) {
+            persistentStreamWriter.markCanceled();
+            return;
+        }
+        PageStreamPublisher.StreamFooter footer = publisher.footer();
+        boolean partial = footer != null && footer.isPartial();
+        long tookMillis = footer != null ? footer.tookMillis() : (System.nanoTime() - startNanos) / 1_000_000L;
+        persistentStreamWriter.markFailed(partial, tookMillis, e);
     }
 
     /** Whether the rows and bytes written so far already fill {@code max_rows} or {@code max_bytes}. */
@@ -161,7 +291,7 @@ public class EsqlStreamResponseListener implements ActionListener<ActionResponse
     /**
      * Ends the response at a limit. The caller has already seen that the result has more rows (a page, or the rest of the
      * current page), so the response is incomplete. Only one last line is ever written: if the response already ended some
-     * other way, this does nothing. The query is cancelled when the response is released.
+     * other way, this does nothing. With {@code store: none} the query is cancelled when the response is released.
      */
     private void finishAtLimit() {
         if (terminalEmitted.compareAndSet(false, true) == false) {
@@ -248,12 +378,32 @@ public class EsqlStreamResponseListener implements ActionListener<ActionResponse
         this.zoneId = resultStream.zoneId();
         assert zoneId != null : "ResultStream must carry the resolved query time zone";
         this.contextRestorer = threadContext.newRestorableContext(false);
-        resultStream.publisher().subscribe(subscriber);
+        if (stores()) {
+            List<ColumnInfo> storedColumns = List.copyOf(columns);
+            this.streamId = persistentStreamWriter.createStarted(resultStream.taskId(), null, storedColumns, Map.of(), List.of());
+        }
+        startConsuming();
+    }
+
+    private void startConsuming() {
+        publisher.subscribe(subscriber);
         subscribed = true;
         subscriber.subscription.request(1);
     }
 
     private void release() {
+        if (stores()) {
+            Page page = inFlightPage.getAndSet(null);
+            if (page != null) {
+                try {
+                    storePage(inFlightSeq, page);
+                } finally {
+                    page.releaseBlocks();
+                }
+            }
+            startDraining();
+            return;
+        }
         Flow.Subscription subscription = subscriber.subscription;
         try {
             if (subscription != null) {
@@ -303,6 +453,9 @@ public class EsqlStreamResponseListener implements ActionListener<ActionResponse
                 if (error instanceof ElasticsearchException ese) {
                     response.copyHeaders(ese);
                 }
+                if (stores()) {
+                    response.addHeader(STREAM_ID_HEADER, streamId);
+                }
                 channel.sendResponse(response);
             } catch (Exception e) {
                 onDeferredSendFailure(status, e);
@@ -318,7 +471,9 @@ public class EsqlStreamResponseListener implements ActionListener<ActionResponse
             pendingTerminalPart = null;
         }
         release();
-        publisher.failStream(e);
+        if (stores() == false) {
+            publisher.failStream(e);
+        }
         if (status != RestStatus.OK) {
             return;
         }
@@ -356,7 +511,7 @@ public class EsqlStreamResponseListener implements ActionListener<ActionResponse
             // direction but publisher-monitor → continuationMonitor in deliverPages(), creating a deadlock.
             Flow.Subscription subscription = subscriber.subscription;
             assert subscription != null : "requestNextChunk before onSubscribe; initializeStream must subscribe before sendResponse";
-            subscription.request(1);
+            requestPage();
         }
     }
 
@@ -370,25 +525,32 @@ public class EsqlStreamResponseListener implements ActionListener<ActionResponse
 
         @Override
         public void onNext(Page page) {
-            if (limitReached()) {
+            if (responseEnded || limitReached()) {
                 // The last page filled the limit exactly and this page shows that the result goes on, so the response
                 // ends here, incomplete. (If the result had ended instead, onComplete would have run.) The Driver drops empty
                 // pages, but one that got here would prove nothing, so it is skipped and the next signal decides.
-                boolean moreRows = page.getPositionCount() > 0;
-                page.releaseBlocks();
-                if (moreRows) {
-                    finishAtLimit();
+                if (page.getPositionCount() == 0) {
+                    page.releaseBlocks();
+                    requestPage();
+                    return;
+                }
+                skipPage(page);
+                if (responseEnded) {
+                    requestPage();
                 } else {
-                    subscription.request(1);
+                    finishAtLimit();
+                    startDraining();
                 }
                 return;
             }
+            int seq = countPage(page);
             if (responseSent == false) {
                 responseSent = true;
+                inFlightSeq = seq;
                 Page previous = inFlightPage.getAndSet(page);
                 assert previous == null : "a page is already in flight before the response was sent";
                 synchronized (continuationMonitor) {
-                    pendingPagePart = new NdjsonPageBodyPart(page, columns, nullColumns, zoneId);
+                    pendingPagePart = new NdjsonPageBodyPart(page, seq, columns, nullColumns, zoneId);
                 }
                 sendDeferred(RestStatus.OK, new NdjsonColumnsBodyPart(columns, nullColumns), null);
                 return;
@@ -399,18 +561,26 @@ public class EsqlStreamResponseListener implements ActionListener<ActionResponse
                 nextBodyPartListener = null;
             }
             if (next == null) {
-                page.releaseBlocks();
+                try {
+                    if (stores()) {
+                        storePage(seq, page);
+                    }
+                } finally {
+                    page.releaseBlocks();
+                }
                 return;
             }
+            inFlightSeq = seq;
             Page previous = inFlightPage.getAndSet(page);
             assert previous == null : "a page is already in flight; demand must be one page at a time";
-            next.onResponse(new NdjsonPageBodyPart(page, columns, nullColumns, zoneId));
+            next.onResponse(new NdjsonPageBodyPart(page, seq, columns, nullColumns, zoneId));
         }
 
         @Override
         public void onError(Throwable throwable) {
+            Exception e = throwable instanceof Exception ex ? ex : new RuntimeException(throwable);
+            failStore(e);
             if (terminalEmitted.compareAndSet(false, true)) {
-                Exception e = throwable instanceof Exception ex ? ex : new RuntimeException(throwable);
                 PageStreamPublisher.StreamFooter footer = publisher.footer();
                 if (footer == null) {
                     footer = fallbackFailureFooter(e);
@@ -431,6 +601,7 @@ public class EsqlStreamResponseListener implements ActionListener<ActionResponse
 
         @Override
         public void onComplete() {
+            completeStore(publisher.footer());
             if (terminalEmitted.compareAndSet(false, true)) {
                 PageStreamPublisher.StreamFooter footer = publisher.footer();
                 ChunkedRestResponseBodyPart footerPart = new NdjsonFooterBodyPart(footer, true);
@@ -519,6 +690,7 @@ public class EsqlStreamResponseListener implements ActionListener<ActionResponse
 
     private class NdjsonPageBodyPart implements ChunkedRestResponseBodyPart {
         private final Page page;
+        private final int seq;
         private final List<ColumnInfoImpl> cols;
         private final boolean[] nullColumns;
         private final ZoneId zoneId;
@@ -542,9 +714,11 @@ public class EsqlStreamResponseListener implements ActionListener<ActionResponse
         private BytesRef scratch;                  // built once on the first encodeChunk
         private int nextRow = 0;                   // resume cursor into the page
         private boolean encoded = false;           // true only after the last row has been written
+        private boolean sentPartially = false;
 
-        NdjsonPageBodyPart(Page page, List<ColumnInfoImpl> cols, boolean[] nullColumns, ZoneId zoneId) {
+        NdjsonPageBodyPart(Page page, int seq, List<ColumnInfoImpl> cols, boolean[] nullColumns, ZoneId zoneId) {
             this.page = page;
+            this.seq = seq;
             this.cols = cols;
             this.nullColumns = nullColumns;
             this.zoneId = zoneId;
@@ -614,6 +788,7 @@ public class EsqlStreamResponseListener implements ActionListener<ActionResponse
                     rowsInChunk++;
                     if (nextRow < rowCount && options.reached(rowsBefore + rowsInChunk, bytesBefore + chunkStream.size())) {
                         limitInsidePage = true;
+                        sentPartially = true;
                         break;
                     }
                     if (chunkStream.size() >= sizeHint) {
@@ -636,6 +811,7 @@ public class EsqlStreamResponseListener implements ActionListener<ActionResponse
             } catch (Exception e) {
                 logger.error("failure encoding page chunk", e);
                 encoded = true; // part is dead; never re-enter it
+                sentPartially = true;
                 IOUtils.closeWhileHandlingException(chunkStream);
                 target = null;
                 releasePage();
@@ -648,9 +824,7 @@ public class EsqlStreamResponseListener implements ActionListener<ActionResponse
         }
 
         private void releasePage() {
-            if (inFlightPage.compareAndSet(page, null)) {
-                page.releaseBlocks();
-            }
+            finishPage(page, seq, sentPartially == false);
         }
 
         @Override
