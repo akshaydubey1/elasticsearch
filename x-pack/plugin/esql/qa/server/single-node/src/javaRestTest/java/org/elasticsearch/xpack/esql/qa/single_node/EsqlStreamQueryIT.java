@@ -466,11 +466,11 @@ public class EsqlStreamQueryIT extends ESRestTestCase {
         assertThat(streamed.footer().get("complete"), equalTo(true));
     }
 
-    public void testStoreOtherThanNoneIsRejected() {
-        for (String store : new String[] { "overflow", "all", "bogus" }) {
+    public void testUnknownStoreIsRejected() {
+        for (String store : new String[] { "bogus", "ALL" }) {
             assertStreamRejected(
                 "{\"query\": \"FROM stream-test | LIMIT 1\", \"store\": \"" + store + "\"}",
-                "[store] only supports [none] for now, got [" + store + "]"
+                "[store] must be one of [none, overflow, all], got [q" + store + "]"
             );
         }
     }

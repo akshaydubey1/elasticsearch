@@ -186,13 +186,24 @@ public class RestEsqlStreamQueryActionTests extends ESTestCase {
         );
     }
 
-    public void testStoreOtherThanNoneIsRejected() {
-        for (String store : new String[] { "overflow", "all", "bogus" }) {
+    public void testStoreModesAreParsed() throws IOException {
+        assertThat(
+            parseStream("{\"query\": \"FROM idx\", \"store\": \"overflow\"}").options(),
+            equalTo(new StreamOptions(StreamOptions.Store.OVERFLOW, StreamOptions.NO_LIMIT, StreamOptions.NO_LIMIT))
+        );
+        assertThat(
+            parseStream("{\"query\": \"FROM idx\", \"store\": \"all\", \"max_rows\": 10}").options(),
+            equalTo(new StreamOptions(StreamOptions.Store.ALL, 10, StreamOptions.NO_LIMIT))
+        );
+    }
+
+    public void testUnknownStoreIsRejected() {
+        for (String store : new String[] { "bogus", "ALL", "" }) {
             XContentParseException e = expectThrows(
                 XContentParseException.class,
                 () -> parseStream("{\"query\": \"FROM idx\", \"store\": \"" + store + "\"}")
             );
-            assertThat(e.getCause().getMessage(), equalTo("[store] must be one of [none], got [" + store + "]"));
+            assertThat(e.getCause().getMessage(), equalTo("[store] must be one of [none, overflow, all], got [" + store + "]"));
         }
     }
 
