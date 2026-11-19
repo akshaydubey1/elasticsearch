@@ -22,11 +22,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * flushes the remainder so the query profile is exact. Abort-in-flight slack (bytes sitting
  * in an SDK buffer that never reached {@code read}) is unobservable and excluded.
  * <p>
- * {@link #abort()} publishes the same delivered totals, then runs the optional {@code onAbort}
- * callback instead of {@link InputStream#close()}. S3 sets that callback so the HTTP connection is
- * discarded without draining; other providers omit it and abort falls through to close.
- * S3 leftover drain after {@code close()} is a second APM bytes event via
- * {@link StorageObjectMetricsCounters#publishDrainedBytes}; abort skips leftover (no {@code onDrained}).
+ * {@link #abort()} is {@link #close()}: the inner stream decides drain vs drop. S3 leftover drain
+ * after a small-tail close is a second APM bytes event via
+ * {@link StorageObjectMetricsCounters#publishDrainedBytes}.
  */
 public final class MeteredInputStream extends FilterInputStream {
 
@@ -34,23 +32,14 @@ public final class MeteredInputStream extends FilterInputStream {
     static final int PUBLISH_CHUNK_BYTES = 256 * 1024;
 
     private final StorageObjectMetricsCounters counters;
-    private final Runnable onAbort;
     private final AtomicBoolean closed = new AtomicBoolean();
 
     private long local;
     private long lastPublished;
 
     public MeteredInputStream(InputStream in, StorageObjectMetricsCounters counters) {
-        this(in, counters, null);
-    }
-
-    /**
-     * @param onAbort if non-null, {@link #abort()} runs this instead of {@code in.close()}
-     */
-    public MeteredInputStream(InputStream in, StorageObjectMetricsCounters counters, Runnable onAbort) {
         super(in);
         this.counters = counters;
-        this.onAbort = onAbort;
     }
 
     @Override
@@ -96,16 +85,16 @@ public final class MeteredInputStream extends FilterInputStream {
     }
 
     /**
-     * Flushes remaining bytes and publishes the stream total once, then aborts the inner
-     * stream when {@code onAbort} was set, otherwise closes it. Idempotent with {@link #close()}.
+     * Same as {@link #close()}. Kept so existing abort call sites compile while the leaf owns
+     * drain vs drop.
      */
     public void abort() throws IOException {
-        finish(true);
+        close();
     }
 
     @Override
     public void close() throws IOException {
-        finish(false);
+        finish();
     }
 
     private void account(long n) {
@@ -117,7 +106,7 @@ public final class MeteredInputStream extends FilterInputStream {
         }
     }
 
-    private void finish(boolean abort) throws IOException {
+    private void finish() throws IOException {
         if (closed.compareAndSet(false, true) == false) {
             return;
         }
@@ -127,10 +116,6 @@ public final class MeteredInputStream extends FilterInputStream {
             lastPublished = local;
         }
         counters.publishStreamBytes(local);
-        if (abort && onAbort != null) {
-            onAbort.run();
-        } else {
-            in.close();
-        }
+        in.close();
     }
 }

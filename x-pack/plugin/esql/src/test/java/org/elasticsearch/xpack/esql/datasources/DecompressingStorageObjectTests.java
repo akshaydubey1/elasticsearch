@@ -418,9 +418,9 @@ public class DecompressingStorageObjectTests extends ESTestCase {
         byte[] prefix = new byte[1024];
         assertThat(stream.read(prefix), Matchers.greaterThan(0));
         stream.close();
+        int afterFirst = tracking.abortCalls.get();
         stream.close();
-
-        assertEquals("second close must not abort again", 1, tracking.abortCalls.get());
+        assertEquals("second close must not abort again", afterFirst, tracking.abortCalls.get());
     }
 
     /**
@@ -480,8 +480,8 @@ public class DecompressingStorageObjectTests extends ESTestCase {
             assertArrayEquals(original, stream.readAllBytes());
         }
 
-        assertEquals("abortStream must be invoked exactly once", 1, tracking.abortCalls.get());
-        assertTrue("a fully decoded body must reach end-of-body before the abort", tracking.endOfBodyReadBeforeAbort.get());
+        assertEquals("a fully decoded body must not drop the connection", 0, tracking.abortCalls.get());
+        assertTrue("a fully decoded body must reach end-of-body before close", tracking.endOfBodyReadBeforeAbort.get());
         assertEquals(compressed.length, tracking.bytesConsumed.get());
     }
 
@@ -504,7 +504,7 @@ public class DecompressingStorageObjectTests extends ESTestCase {
             assertArrayEquals(original, stream.readAllBytes());
         }
 
-        assertEquals(1, tracking.abortCalls.get());
+        assertEquals(0, tracking.abortCalls.get());
         assertTrue(tracking.endOfBodyReadBeforeAbort.get());
         assertEquals(compressed.length, tracking.bytesConsumed.get());
     }
@@ -551,7 +551,7 @@ public class DecompressingStorageObjectTests extends ESTestCase {
         IOException e = expectThrows(IOException.class, stream::readAllBytes);
         assertThat(e.getMessage(), Matchers.containsString("Trailing garbage"));
         stream.close();
-        assertEquals(1, tracking.abortCalls.get());
+        assertTrue("trailing-garbage close must still release the raw GET", tracking.closed.get());
     }
 
     /** Multi-member gzip read through a raw stream that reports nothing available and never crosses a member boundary. */
@@ -571,12 +571,13 @@ public class DecompressingStorageObjectTests extends ESTestCase {
         StorageObject raw = new BytesStorageObject(all, StoragePath.of("s3://bucket/test.ndjson.gz")) {
             @Override
             public InputStream newStream() {
-                return boundaryAlignedStream(all, boundaries);
-            }
-
-            @Override
-            public void abortStream(InputStream stream) {
-                abortCalls.incrementAndGet();
+                return new FilterInputStream(boundaryAlignedStream(all, boundaries)) {
+                    @Override
+                    public void close() throws IOException {
+                        abortCalls.incrementAndGet();
+                        super.close();
+                    }
+                };
             }
         };
         DecompressingStorageObject decompressing = new DecompressingStorageObject(raw, new GzipDecompressionCodec());
@@ -695,12 +696,13 @@ public class DecompressingStorageObjectTests extends ESTestCase {
                         }
                         return n;
                     }
-                };
-            }
 
-            @Override
-            public void abortStream(InputStream stream) {
-                abortCalls.incrementAndGet();
+                    @Override
+                    public void close() throws IOException {
+                        abortCalls.incrementAndGet();
+                        super.close();
+                    }
+                };
             }
         };
         DecompressingStorageObject decompressing = new DecompressingStorageObject(raw, new StopsBeforeRawEndCodec(original.length));
@@ -730,12 +732,13 @@ public class DecompressingStorageObjectTests extends ESTestCase {
                         }
                         return n;
                     }
-                };
-            }
 
-            @Override
-            public void abortStream(InputStream stream) {
-                abortCalls.incrementAndGet();
+                    @Override
+                    public void close() throws IOException {
+                        abortCalls.incrementAndGet();
+                        super.close();
+                    }
+                };
             }
         };
         DecompressingStorageObject decompressing = new DecompressingStorageObject(raw, new StopsBeforeRawEndCodec(original.length));

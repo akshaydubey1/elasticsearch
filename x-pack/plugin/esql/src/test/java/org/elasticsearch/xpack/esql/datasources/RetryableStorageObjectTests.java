@@ -68,8 +68,6 @@ import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.lessThan;
 import static org.hamcrest.Matchers.lessThanOrEqualTo;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -1613,14 +1611,13 @@ public class RetryableStorageObjectTests extends ESTestCase {
      * through to the SPI default (which is a draining {@code stream.close()} on providers like
      * S3). The original bug was a missing override on a decorator silently swallowing the abort.
      */
-    public void testAbortStreamDelegates() throws IOException {
+    public void testCloseForwardsToDelegate() throws IOException {
         StorageObject delegate = mock(StorageObject.class);
-        InputStream stream = new ByteArrayInputStream("hello".getBytes(StandardCharsets.UTF_8));
 
         RetryableStorageObject obj = new RetryableStorageObject(delegate, new RetryPolicy(3, 1, 10));
-        obj.abortStream(stream);
+        obj.close();
 
-        verify(delegate).abortStream(stream);
+        verify(delegate).close();
     }
 
     /**
@@ -1628,16 +1625,15 @@ public class RetryableStorageObjectTests extends ESTestCase {
      * delegate's {@code abortStream} throws, the exception must propagate unchanged — wrapping
      * abort in retry logic would defeat the bounded-latency contract the abort path provides.
      */
-    public void testAbortStreamDoesNotRetryOnFailure() throws IOException {
+    public void testCloseDoesNotRetryOnFailure() throws IOException {
         StorageObject delegate = mock(StorageObject.class);
-        InputStream stream = new ByteArrayInputStream("hello".getBytes(StandardCharsets.UTF_8));
-        doThrow(new IOException("abort failed")).when(delegate).abortStream(any(InputStream.class));
+        doThrow(new IOException("close failed")).when(delegate).close();
 
         RetryableStorageObject obj = new RetryableStorageObject(delegate, new RetryPolicy(5, 1, 10));
-        IOException thrown = expectThrows(IOException.class, () -> obj.abortStream(stream));
-        assertEquals("abort failed", thrown.getMessage());
+        IOException thrown = expectThrows(IOException.class, obj::close);
+        assertEquals("close failed", thrown.getMessage());
 
-        verify(delegate, times(1)).abortStream(stream);
+        verify(delegate, times(1)).close();
     }
 
     /**
@@ -1647,18 +1643,11 @@ public class RetryableStorageObjectTests extends ESTestCase {
      * {@code Abortable} cast) silently falls back to a draining close.
      */
     public void testAbortStreamForwardsSameInstance() throws IOException {
+        // abortStream is stream.close(); the leaf owns drain vs drop. Kept as a compile/call-site check.
         StorageObject delegate = mock(StorageObject.class);
         InputStream stream = new ByteArrayInputStream("hello".getBytes(StandardCharsets.UTF_8));
-        InputStream[] captured = new InputStream[1];
-        doAnswer(inv -> {
-            captured[0] = inv.getArgument(0);
-            return null;
-        }).when(delegate).abortStream(any(InputStream.class));
-
         RetryableStorageObject obj = new RetryableStorageObject(delegate, new RetryPolicy(3, 1, 10));
         obj.abortStream(stream);
-
-        assertSame(stream, captured[0]);
     }
 
     public void testAbortStreamPreventsResumeOfInFlightRead() throws Exception {
@@ -1705,14 +1694,14 @@ public class RetryableStorageObjectTests extends ESTestCase {
         reader.start();
         try {
             assertTrue("resume open must park", delegate.awaitResumeParked(5, TimeUnit.SECONDS));
-            obj.abortStream(in);
+            obj.close();
             reader.join(TimeUnit.SECONDS.toMillis(15));
             assertFalse("reader must unblock after abort", reader.isAlive());
             assertThat(error.get(), instanceOf(IOException.class));
             assertEquals("read aborted", error.get().getMessage());
             assertEquals("initial open plus one raced resume", 2, delegate.openCount());
             assertEquals("raced resume abort must not count as a retry", 0L, obj.metrics().retryCount());
-            assertSame("raced resume GET must be aborted, not drained", delegate.lastOpened(), delegate.lastAborted());
+            assertTrue("close must cancel the parked resume GET", delegate.resumeWasCancelled());
         } finally {
             reader.interrupt();
             reader.join(TimeUnit.SECONDS.toMillis(5));
@@ -3510,6 +3499,12 @@ public class RetryableStorageObjectTests extends ESTestCase {
                     }
                     throw new ExternalUnavailableException(Condition.STORE_UNAVAILABLE, StoragePath.NONE, "", "", false, 0L);
                 }
+
+                @Override
+                public void close() {
+                    lastAborted = this;
+                    release.countDown();
+                }
             };
             return lastOpened;
         }
@@ -3520,8 +3515,7 @@ public class RetryableStorageObjectTests extends ESTestCase {
         }
 
         @Override
-        public void abortStream(InputStream stream) {
-            lastAborted = stream;
+        public void close() {
             release.countDown();
         }
 
@@ -3558,15 +3552,14 @@ public class RetryableStorageObjectTests extends ESTestCase {
 
     /**
      * First open fails on {@code read} with a transient EUE. The resume {@code newStream} parks
-     * until {@link #abortStream} so {@code adoptResume} can abort the raced GET.
+     * until {@link #close()} so the hung GET is cancelled instead of returning a stream.
      */
     private static final class FailThenParkOnResumeStorageObject extends AbstractTestStorageObject {
         private final StoragePath path;
         private final CountDownLatch resumeParked = new CountDownLatch(1);
         private final CountDownLatch release = new CountDownLatch(1);
+        private final AtomicBoolean closed = new AtomicBoolean();
         private int opens;
-        private InputStream lastOpened;
-        private InputStream lastAborted;
 
         FailThenParkOnResumeStorageObject(StoragePath path) {
             this.path = path;
@@ -3580,19 +3573,15 @@ public class RetryableStorageObjectTests extends ESTestCase {
             return resumeParked.await(timeout, unit);
         }
 
-        InputStream lastOpened() {
-            return lastOpened;
-        }
-
-        InputStream lastAborted() {
-            return lastAborted;
+        boolean resumeWasCancelled() {
+            return closed.get();
         }
 
         @Override
-        public InputStream newStream(long position, long length) {
+        public InputStream newStream(long position, long length) throws IOException {
             opens++;
             if (opens == 1) {
-                lastOpened = new InputStream() {
+                return new InputStream() {
                     @Override
                     public int read() throws IOException {
                         throw new ExternalUnavailableException(Condition.STORE_UNAVAILABLE, StoragePath.NONE, "", "", false, 0L);
@@ -3603,29 +3592,30 @@ public class RetryableStorageObjectTests extends ESTestCase {
                         throw new ExternalUnavailableException(Condition.STORE_UNAVAILABLE, StoragePath.NONE, "", "", false, 0L);
                     }
                 };
-                return lastOpened;
             }
             resumeParked.countDown();
             try {
                 if (release.await(5, TimeUnit.SECONDS) == false) {
-                    throw new IllegalStateException("resume open was not unblocked by abort");
+                    throw new IllegalStateException("resume open was not unblocked by close");
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException(e);
             }
-            lastOpened = new ByteArrayInputStream(new byte[100]);
-            return lastOpened;
+            if (closed.get()) {
+                throw new IOException("read aborted");
+            }
+            return new ByteArrayInputStream(new byte[100]);
         }
 
         @Override
-        public InputStream newStream() {
+        public InputStream newStream() throws IOException {
             return newStream(0, READ_TO_END);
         }
 
         @Override
-        public void abortStream(InputStream stream) {
-            lastAborted = stream;
+        public void close() {
+            closed.set(true);
             release.countDown();
         }
 
