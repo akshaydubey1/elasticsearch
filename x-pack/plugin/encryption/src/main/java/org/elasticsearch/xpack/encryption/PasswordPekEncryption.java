@@ -55,9 +55,8 @@ public final class PasswordPekEncryption implements ProjectEncryptionKeyMetadata
 
     /**
      * Returns whether nodes needn't be checked for the password, because on stateless it comes from {@link ClusterSecrets} in cluster
-     * state, the same on every node. Cluster secrets without the active password id don't count: their reload would remove a password
-     * from the keystore, which the checks must still catch. Stateful nodes are always checked: a node persists a cluster state before
-     * applying it, so it writes the key with the password it had before the cluster secrets in that state reach it.
+     * state, the same on every node. Stateful nodes are always checked: a node persists a cluster state before applying it, so it
+     * writes the key with the password it had before the cluster secrets in that state reach it.
      */
     static boolean passwordsFromClusterSecrets(ClusterState state, boolean stateless) {
         ClusterSecrets secrets = state.custom(ClusterSecrets.TYPE);

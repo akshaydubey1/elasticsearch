@@ -504,9 +504,9 @@ public class ProjectEncryptionKeyMetadataTests extends ChunkedToXContentDiffable
         assertEquals(Boolean.TRUE, keys.holdsKeys());
         assertEquals(PASSWORD_ID, keys.passwordId());
 
-        keys.clearIfActiveKey("other");
+        keys.forgetCopyOf("other");
         assertEquals("a reset of another key leaves this copy", Boolean.TRUE, keys.holdsKeys());
-        keys.clearIfActiveKey("k1");
+        keys.forgetCopyOf("k1");
         assertNull(keys.holdsKeys());
         assertNull(keys.passwordId());
     }

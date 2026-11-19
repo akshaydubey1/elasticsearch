@@ -176,7 +176,7 @@ class ProjectEncryptionKeyMetadata extends AbstractNamedDiffable<Metadata.Projec
         }
 
         /** Forgets this node's copy if it is for {@code activeKeyId}, a key that a reset removed. */
-        synchronized void clearIfActiveKey(String activeKeyId) {
+        synchronized void forgetCopyOf(String activeKeyId) {
             if (copy == null || copy.activeKeyId().equals(activeKeyId)) {
                 copy = null;
                 known = false;
@@ -331,9 +331,14 @@ class ProjectEncryptionKeyMetadata extends AbstractNamedDiffable<Metadata.Projec
      */
     @Nullable
     static ProjectEncryptionKeyMetadata unwrapGatewayKeys(String activeKeyId, PekEncryption pekEncryption) {
-        GatewayKeys gatewayKeys = pekEncryption.gatewayKeys();
-        GatewayCopy copy = gatewayKeys == null ? null : gatewayKeys.copyFor(activeKeyId);
+        GatewayCopy copy = gatewayCopyFor(activeKeyId, pekEncryption);
         return copy == null ? null : unwrap(copy, pekEncryption);
+    }
+
+    @Nullable
+    private static GatewayCopy gatewayCopyFor(@Nullable String activeKeyId, PekEncryption pekEncryption) {
+        GatewayKeys gatewayKeys = pekEncryption.gatewayKeys();
+        return gatewayKeys == null ? null : gatewayKeys.copyFor(activeKeyId);
     }
 
     static String generateKeyId() {
@@ -448,10 +453,9 @@ class ProjectEncryptionKeyMetadata extends AbstractNamedDiffable<Metadata.Projec
             return apiChunk();
         }
 
-        GatewayKeys gatewayKeys = pekEncryption.gatewayKeys();
         if (unwrapFailureReason != null) {
             // a copy for a different active key would roll the key set back if this node were later elected master
-            GatewayCopy copy = gatewayKeys == null || activeKeyId == null ? null : gatewayKeys.copyFor(activeKeyId);
+            GatewayCopy copy = gatewayCopyFor(activeKeyId, pekEncryption);
             if (copy == null) {
                 setGatewayCopy(null);
                 return emptyGatewayChunk();

@@ -13,7 +13,6 @@ import org.elasticsearch.cluster.coordination.JoinValidationService;
 import org.elasticsearch.cluster.coordination.stateless.StoreHeartbeatService;
 import org.elasticsearch.cluster.metadata.ReservedStateMetadata;
 import org.elasticsearch.common.Priority;
-import org.elasticsearch.common.settings.MockSecureSettings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.plugins.Plugin;
@@ -32,6 +31,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
+import static org.elasticsearch.xpack.encryption.EncryptionIntegTestUtils.passwordSettings;
 import static org.elasticsearch.xpack.encryption.ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY;
 import static org.elasticsearch.xpack.encryption.ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX;
 import static org.hamcrest.Matchers.equalTo;
@@ -216,13 +216,6 @@ public class StatelessEncryptionPasswordIT extends AbstractStatelessPluginIntegT
 
     private static PasswordPekEncryption pekEncryption(String node) {
         return internalCluster().getInstance(PasswordPekEncryption.class, node);
-    }
-
-    private static Settings passwordSettings(String passwordId, String password) {
-        MockSecureSettings secure = new MockSecureSettings();
-        secure.setString(ACTIVE_PASSWORD_ID_KEY, passwordId);
-        secure.setString(PASSWORD_PREFIX + passwordId, password);
-        return Settings.builder().setSecureSettings(secure).build();
     }
 
     private static void reload(String node, Settings settings) {

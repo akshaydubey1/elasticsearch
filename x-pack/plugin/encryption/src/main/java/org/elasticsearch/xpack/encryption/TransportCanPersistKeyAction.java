@@ -31,7 +31,7 @@ import java.util.stream.Collectors;
 
 /**
  * Asks nodes whether they can write the project encryption key to their disk. The elected master installs the first key only once every
- * master-eligible and data node can, since a node that cannot persist the key cannot persist cluster state at all.
+ * node that persists cluster state can, since a node that cannot persist the key cannot persist cluster state at all.
  */
 public class TransportCanPersistKeyAction extends TransportNodesAction<
     TransportCanPersistKeyAction.Request,

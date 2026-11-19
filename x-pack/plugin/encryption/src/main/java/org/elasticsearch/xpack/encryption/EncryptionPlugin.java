@@ -151,7 +151,7 @@ public class EncryptionPlugin extends Plugin
     @Override
     public synchronized void reload(Settings settings) {
         Settings updated = ProjectEncryptionKeyPasswordSettings.cloneSettings(settings);
-        if (persistsClusterState && clusterUsesKey()) {
+        if (persistsClusterState && mustKeepPasswords()) {
             ProjectEncryptionKeyPasswordSettings.validateReload(
                 pekEncryption.canWrapForDisk(),
                 pekSettings,
@@ -166,8 +166,8 @@ public class EncryptionPlugin extends Plugin
         }
     }
 
-    // including while the elected master holds no key, since the key can still be restored
-    private boolean clusterUsesKey() {
+    // while the cluster has a key, including while the elected master holds none, since the key can still be restored
+    private boolean mustKeepPasswords() {
         ProjectEncryptionKeyService service = pekService.get();
         ClusterService localClusterService = clusterService.get();
         if (service == null || localClusterService == null) {
@@ -184,34 +184,33 @@ public class EncryptionPlugin extends Plugin
      */
     @Override
     public BiConsumer<DiscoveryNode, ClusterState> getJoinValidator() {
-        if (persistsClusterState == false) {
-            return null;
+        return persistsClusterState ? this::rejectIfThisNodeCannotPersistKey : null;
+    }
+
+    private void rejectIfThisNodeCannotPersistKey(DiscoveryNode node, ClusterState state) {
+        ClusterService localClusterService = clusterService.get();
+        ProjectEncryptionKeyService service = pekService.get();
+        // the master also runs join validators, for the joining node, which this node's settings say nothing about
+        if (localClusterService == null || service == null || node.getId().equals(localClusterService.localNode().getId()) == false) {
+            return;
         }
-        return (node, state) -> {
-            ClusterService localClusterService = clusterService.get();
-            ProjectEncryptionKeyService service = pekService.get();
-            // the master also runs join validators, for the joining node, which this node's settings say nothing about
-            if (localClusterService == null || service == null || node.getId().equals(localClusterService.localNode().getId()) == false) {
-                return;
-            }
-            // the node gets the password from cluster secrets once it joins, whatever it loaded at startup
-            if (PasswordPekEncryption.passwordsFromClusterSecrets(state, stateless)) {
-                return;
-            }
-            ProjectEncryptionKeyMetadata metadata = service.metadataIn(state);
-            String wrapFailure = metadata == null || metadata.isUnwrapFailed() ? null : pekEncryption.wrapForDiskFailure();
-            if (wrapFailure != null) {
-                throw new IllegalStateException(
-                    "this node cannot join the cluster: the cluster uses a cluster state encryption key and this node cannot persist it ("
-                        + wrapFailure
-                        + "). Configure ["
-                        + ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY
-                        + "] and the matching ["
-                        + ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX
-                        + "<id>] secure setting in this node's keystore, then restart it or reload its secure settings"
-                );
-            }
-        };
+        // the node gets the password from cluster secrets once it joins, whatever it loaded at startup
+        if (PasswordPekEncryption.passwordsFromClusterSecrets(state, stateless)) {
+            return;
+        }
+        ProjectEncryptionKeyMetadata metadata = service.metadataIn(state);
+        String wrapFailure = metadata == null || metadata.isUnwrapFailed() ? null : pekEncryption.wrapForDiskFailure();
+        if (wrapFailure != null) {
+            throw new IllegalStateException(
+                "this node cannot join the cluster: the cluster uses a cluster state encryption key and this node cannot persist it ("
+                    + wrapFailure
+                    + "). Configure ["
+                    + ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY
+                    + "] and the matching ["
+                    + ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX
+                    + "<id>] secure setting in this node's keystore, then restart it or reload its secure settings"
+            );
+        }
     }
 
     @Override

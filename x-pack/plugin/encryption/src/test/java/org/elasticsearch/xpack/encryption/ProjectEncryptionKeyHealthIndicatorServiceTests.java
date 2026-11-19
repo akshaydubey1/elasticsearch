@@ -12,7 +12,6 @@ import org.elasticsearch.cluster.metadata.Metadata;
 import org.elasticsearch.cluster.metadata.ProjectMetadata;
 import org.elasticsearch.cluster.project.DefaultProjectResolver;
 import org.elasticsearch.cluster.service.ClusterService;
-import org.elasticsearch.common.settings.MockSecureSettings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.health.HealthIndicatorResult;
 import org.elasticsearch.health.HealthStatus;
@@ -39,17 +38,10 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
     private static final String PASSWORD_ID = "v1";
     private static final ProjectEncryptionKeyMetadata.PekEncryption NO_OP_ENCRYPTION = TestPekEncryption.NO_OP;
     // at least 14 characters, as FIPS requires
-    private static final Settings PASSWORD_SETTINGS = passwordSettings();
+    private static final Settings PASSWORD_SETTINGS = EncryptionIntegTestUtils.passwordSettings(PASSWORD_ID, "test-password-fips");
     private static final ToXContent.Params GATEWAY = new ToXContent.MapParams(
         Map.of(Metadata.CONTEXT_MODE_PARAM, Metadata.CONTEXT_MODE_GATEWAY)
     );
-
-    private static Settings passwordSettings() {
-        MockSecureSettings secure = new MockSecureSettings();
-        secure.setString(ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY, PASSWORD_ID);
-        secure.setString(ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX + PASSWORD_ID, "test-password-fips");
-        return Settings.builder().setSecureSettings(secure).build();
-    }
 
     private static byte[] randomKeyBytes() {
         return randomByteArrayOfLength(PasswordBasedEncryption.PEK_LENGTH_BYTES);
@@ -93,16 +85,7 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
     }
 
     private static ProjectEncryptionKeyHealthIndicatorService indicator(ClusterState state, ProjectEncryptionKeyService pekService) {
-        return indicator(state, pekService, new PasswordPekEncryption(() -> PASSWORD_SETTINGS), List.of());
-    }
-
-    private static ProjectEncryptionKeyHealthIndicatorService indicator(
-        ClusterState state,
-        ProjectEncryptionKeyService pekService,
-        PasswordPekEncryption pekEncryption,
-        List<EncryptedDataHandler<?>> handlers
-    ) {
-        return indicator(state, pekService, pekEncryption, handlers, Set.of());
+        return indicator(state, pekService, new PasswordPekEncryption(() -> PASSWORD_SETTINGS), List.of(), Set.of());
     }
 
     private static ProjectEncryptionKeyHealthIndicatorService indicator(
@@ -229,7 +212,8 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
             state,
             mockPekService(EncryptionServiceState.READY, null),
             new PasswordPekEncryption(() -> Settings.EMPTY),
-            List.of()
+            List.of(),
+            Set.of()
         );
 
         HealthIndicatorResult result = indicator.calculate(false, 1, HealthInfo.EMPTY_HEALTH_INFO);
@@ -269,7 +253,8 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
             state,
             mockPekService(EncryptionServiceState.UNAVAILABLE_DECRYPTION_FAILED, PASSWORD_ID),
             new PasswordPekEncryption(() -> PASSWORD_SETTINGS),
-            List.of(handler)
+            List.of(handler),
+            Set.of()
         );
 
         HealthIndicatorResult result = indicator.calculate(true, 1, HealthInfo.EMPTY_HEALTH_INFO);
@@ -322,7 +307,8 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
             stateWith(metadata),
             mockPekService(EncryptionServiceState.READY, PASSWORD_ID),
             pekEncryption,
-            List.of()
+            List.of(),
+            Set.of()
         );
         assertFalse(
             "nothing read or written yet",
@@ -340,10 +326,7 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
         assertEquals(true, details.get("can_read_key_on_disk"));
         assertEquals(PASSWORD_ID, details.get("key_on_disk_password_id"));
 
-        MockSecureSettings wrongPassword = new MockSecureSettings();
-        wrongPassword.setString(ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY, PASSWORD_ID);
-        wrongPassword.setString(ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX + PASSWORD_ID, "another-password-fips");
-        settings.set(Settings.builder().setSecureSettings(wrongPassword).build());
+        settings.set(EncryptionIntegTestUtils.passwordSettings(PASSWORD_ID, "another-password-fips"));
         assertEquals(
             "a password with the same id that doesn't decrypt the copy",
             false,

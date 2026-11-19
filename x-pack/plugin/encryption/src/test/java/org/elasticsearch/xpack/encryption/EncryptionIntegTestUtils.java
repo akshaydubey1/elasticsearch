@@ -7,6 +7,8 @@
 package org.elasticsearch.xpack.encryption;
 
 import org.apache.logging.log4j.core.LogEvent;
+import org.elasticsearch.common.settings.MockSecureSettings;
+import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.core.Strings;
 import org.elasticsearch.test.MockLog;
 
@@ -20,6 +22,14 @@ import static org.junit.Assert.assertTrue;
 public final class EncryptionIntegTestUtils {
 
     private EncryptionIntegTestUtils() {}
+
+    /** Secure settings with {@code passwordId} as the active password id and {@code password} as its password. */
+    public static Settings passwordSettings(String passwordId, String password) {
+        MockSecureSettings secure = new MockSecureSettings();
+        secure.setString(ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY, passwordId);
+        secure.setString(ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX + passwordId, password);
+        return Settings.builder().setSecureSettings(secure).build();
+    }
 
     /** File settings whose cluster secrets hold the given secrets, as alternating names and values. */
     public static String clusterSecretsJson(long version, String... namesAndValues) {

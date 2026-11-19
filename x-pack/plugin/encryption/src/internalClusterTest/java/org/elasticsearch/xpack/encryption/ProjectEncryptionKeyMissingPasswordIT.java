@@ -12,7 +12,6 @@ import org.elasticsearch.action.admin.cluster.configuration.TransportAddVotingCo
 import org.elasticsearch.action.admin.cluster.configuration.TransportClearVotingConfigExclusionsAction;
 import org.elasticsearch.cluster.coordination.JoinHelper;
 import org.elasticsearch.cluster.service.ClusterService;
-import org.elasticsearch.common.settings.MockSecureSettings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.health.HealthIndicatorResult;
 import org.elasticsearch.health.HealthStatus;
@@ -26,6 +25,7 @@ import org.elasticsearch.xpack.encryption.spi.EncryptedData;
 import org.elasticsearch.xpack.encryption.spi.EncryptionService;
 import org.elasticsearch.xpack.encryption.spi.EncryptionServiceState;
 import org.elasticsearch.xpack.encryption.spi.EncryptionServiceUnavailableException;
+import org.junit.Before;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -60,12 +60,14 @@ public class ProjectEncryptionKeyMissingPasswordIT extends ESIntegTestCase {
         return plugins;
     }
 
+    @Before
+    public void bootstrapFirstMaster() {
+        internalCluster().setBootstrapMasterNodeIndex(0);
+    }
+
     /** Once the key is installed, a node without a password can't join, and the password can't be reloaded away. */
     public void testNodeWithoutPasswordCannotJoinOnceKeyIsInstalled() throws Exception {
-        internalCluster().setBootstrapMasterNodeIndex(0);
-        String master = internalCluster().startNode();
-        reload(master, passwordSettings());
-        assertBusy(() -> assertThat(pekOn(master), notNullValue()));
+        String master = startNodesWithKey(1).get(0);
 
         String joining;
         try (MockLog mockLog = MockLog.capture(JoinHelper.class)) {
@@ -95,10 +97,7 @@ public class ProjectEncryptionKeyMissingPasswordIT extends ESIntegTestCase {
      * disk.
      */
     public void testElectedMasterWithoutKeyReadsItOnceItHasThePassword() throws Exception {
-        internalCluster().setBootstrapMasterNodeIndex(0);
-        String master = internalCluster().startNode();
-        reload(master, passwordSettings());
-        assertBusy(() -> assertThat(pekOn(master), notNullValue()));
+        String master = startNodesWithKey(1).get(0);
         byte[] payload = "missing-password-payload".getBytes(StandardCharsets.UTF_8);
         EncryptedData encrypted = internalCluster().getInstance(EncryptionService.class, master).encrypt(payload);
 
@@ -126,13 +125,7 @@ public class ProjectEncryptionKeyMissingPasswordIT extends ESIntegTestCase {
      * once every node can persist it.
      */
     public void testFailoverToNodeThatCanReadItsCopyRestoresTheKey() throws Exception {
-        internalCluster().setBootstrapMasterNodeIndex(0);
-        List<String> nodes = internalCluster().startNodes(2);
-        ensureStableCluster(2);
-        for (String node : nodes) {
-            reload(node, passwordSettings());
-        }
-        assertBusy(() -> nodes.forEach(node -> assertThat(pekOn(node), notNullValue())), 30, TimeUnit.SECONDS);
+        List<String> nodes = startNodesWithKey(2);
         byte[] payload = "failover-payload".getBytes(StandardCharsets.UTF_8);
         EncryptedData encrypted = internalCluster().getInstance(EncryptionService.class, nodes.get(0)).encrypt(payload);
 
@@ -141,10 +134,7 @@ public class ProjectEncryptionKeyMissingPasswordIT extends ESIntegTestCase {
         String master = internalCluster().getMasterName();
         String other = nodes.stream().filter(node -> node.equals(master) == false).findFirst().orElseThrow();
         reload(other, passwordSettings());
-        MockSecureSettings newPassword = new MockSecureSettings();
-        newPassword.setString(ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY, "v2");
-        newPassword.setString(ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX + "v2", "encryption-test-password-v2");
-        reload(master, Settings.builder().setSecureSettings(newPassword).build());
+        reload(master, EncryptionIntegTestUtils.passwordSettings("v2", "encryption-test-password-v2"));
         assertTrue("the master can't read its copy with a different password", pekOn(master).isUnwrapFailed());
 
         client().execute(TransportAddVotingConfigExclusionsAction.TYPE, new AddVotingConfigExclusionsRequest(TEST_REQUEST_TIMEOUT, master))
@@ -164,13 +154,7 @@ public class ProjectEncryptionKeyMissingPasswordIT extends ESIntegTestCase {
 
     /** No node can read the key: the cluster still forms, so that a reset can recover it. */
     public void testResetRecoversClusterWhereNoNodeCanReadTheKey() throws Exception {
-        internalCluster().setBootstrapMasterNodeIndex(0);
-        List<String> nodes = internalCluster().startNodes(2);
-        ensureStableCluster(2);
-        for (String node : nodes) {
-            reload(node, passwordSettings());
-        }
-        assertBusy(() -> nodes.forEach(node -> assertThat(pekOn(node), notNullValue())), 30, TimeUnit.SECONDS);
+        List<String> nodes = startNodesWithKey(2);
 
         internalCluster().fullRestart();
         ensureStableCluster(2);
@@ -199,11 +183,19 @@ public class ProjectEncryptionKeyMissingPasswordIT extends ESIntegTestCase {
         return internalCluster().getInstance(EncryptionService.class, node).decrypt(encrypted);
     }
 
+    /** Starts the nodes with a password each, and waits for every one of them to hold the key. */
+    private List<String> startNodesWithKey(int count) throws Exception {
+        List<String> nodes = internalCluster().startNodes(count);
+        ensureStableCluster(count);
+        for (String node : nodes) {
+            reload(node, passwordSettings());
+        }
+        assertBusy(() -> nodes.forEach(node -> assertThat(pekOn(node), notNullValue())), 30, TimeUnit.SECONDS);
+        return nodes;
+    }
+
     private static Settings passwordSettings() {
-        MockSecureSettings secure = new MockSecureSettings();
-        secure.setString(ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY, PASSWORD_ID);
-        secure.setString(ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX + PASSWORD_ID, PASSWORD);
-        return Settings.builder().setSecureSettings(secure).build();
+        return EncryptionIntegTestUtils.passwordSettings(PASSWORD_ID, PASSWORD);
     }
 
     private static void reload(String node, Settings settings) {

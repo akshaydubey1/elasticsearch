@@ -82,11 +82,6 @@ final class ProjectEncryptionKeyPasswordSettings {
         return id != null && id.isEmpty() == false && PASSWORD.getConcreteSetting(PASSWORD_PREFIX + id).exists(settings);
     }
 
-    /** Returns whether an active password id and its password are configured. */
-    static boolean hasActivePassword(Settings settings) {
-        return hasPassword(settings, getActivePasswordId(settings));
-    }
-
     /**
      * Returns why {@code settings} don't let a node wrap the key for disk, or {@code null} if they do. Derives a wrapping key, since a
      * configured password can still be unusable, such as one too short for FIPS; that is slow, so callers should cache the result.

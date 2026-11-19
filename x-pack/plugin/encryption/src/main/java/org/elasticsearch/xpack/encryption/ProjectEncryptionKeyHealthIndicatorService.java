@@ -25,7 +25,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.TreeSet;
 import java.util.function.Supplier;
 
 import static org.elasticsearch.health.HealthStatus.GREEN;
@@ -181,63 +180,65 @@ class ProjectEncryptionKeyHealthIndicatorService implements HealthIndicatorServi
         ProjectMetadata project = clusterState.metadata().getProject(projectResolver.getProjectId());
         ProjectEncryptionKeyMetadata metadata = project.custom(ProjectEncryptionKeyMetadata.TYPE);
         EncryptionServiceState serviceState = pekService.state();
+        Set<String> waitingFor = nodesWithoutPassword.get();
+        HealthIndicatorDetails details = details(metadata, serviceState, waitingFor);
 
         return switch (serviceState) {
             case READY -> {
-                if (metadata == null && nodesWithoutPassword.get().isEmpty() == false) {
+                if (metadata == null) {
+                    if (waitingFor.isEmpty()) {
+                        yield createIndicator(
+                            GREEN,
+                            "Cluster state encryption is configured; awaiting first key install.",
+                            details,
+                            List.of(),
+                            List.of()
+                        );
+                    }
                     yield createIndicator(
                         YELLOW,
                         YELLOW_WAITING_FOR_NODES,
-                        detailsBuilder(null, serviceState),
+                        details,
                         WAITING_FOR_NODES_IMPACTS,
                         List.of(new Diagnosis(NODES_WITHOUT_PASSWORD_DEFINITION, List.of()))
-                    );
-                }
-                if (metadata == null) {
-                    yield createIndicator(
-                        GREEN,
-                        "Cluster state encryption is configured; awaiting first key install.",
-                        detailsBuilder(null, serviceState),
-                        List.of(),
-                        List.of()
                     );
                 }
                 if (pekEncryption.canWrapForDisk() == false) {
                     yield createIndicator(
                         YELLOW,
                         YELLOW_CANNOT_PERSIST,
-                        detailsBuilder(metadata, serviceState),
+                        details,
                         WRAP_FAILURE_IMPACTS,
                         List.of(new Diagnosis(MISSING_WRAP_CREDENTIALS_DEFINITION, List.of()))
                     );
                 }
-                yield createIndicator(GREEN, GREEN_HEALTHY, detailsBuilder(metadata, serviceState), List.of(), List.of());
+                yield createIndicator(GREEN, GREEN_HEALTHY, details, List.of(), List.of());
             }
             case DISABLED -> {
                 if (pekService.isEncryptionRequired() == false) {
                     yield createIndicator(
                         YELLOW,
                         YELLOW_OPT_OUT,
-                        detailsBuilder(metadata, serviceState),
+                        details,
                         OPT_OUT_IMPACTS,
                         List.of(new Diagnosis(ENCRYPTION_OPT_OUT_DEFINITION, List.of()))
                     );
                 }
-                yield createIndicator(GREEN, GREEN_NOT_CONFIGURED, detailsBuilder(metadata, serviceState), List.of(), List.of());
+                yield createIndicator(GREEN, GREEN_NOT_CONFIGURED, details, List.of(), List.of());
             }
             case UNAVAILABLE_DECRYPTION_FAILED -> createIndicator(
                 hasEncryptedData(project) ? RED : YELLOW,
                 MASTER_HAS_NO_KEY,
-                detailsBuilder(metadata, serviceState),
+                details,
                 ENCRYPTION_UNAVAILABLE_IMPACTS,
-                nodesWithoutPassword.get().isEmpty()
+                waitingFor.isEmpty()
                     ? List.of(new Diagnosis(DECRYPTION_FAILED_DEFINITION, List.of()))
                     : List.of(new Diagnosis(NODES_WITHOUT_PASSWORD_DEFINITION, List.of()))
             );
             case UNAVAILABLE_MISSING_PASSWORD -> createIndicator(
                 YELLOW,
                 YELLOW_MISSING_PASSWORD,
-                detailsBuilder(metadata, serviceState),
+                details,
                 ENCRYPTION_UNAVAILABLE_IMPACTS,
                 List.of(new Diagnosis(MISSING_PASSWORD_DEFINITION, List.of()))
             );
@@ -248,27 +249,21 @@ class ProjectEncryptionKeyHealthIndicatorService implements HealthIndicatorServi
         return handlerRegistry.handlers().stream().anyMatch(handler -> EncryptedDataHandlerRegistry.hasData(handler, project));
     }
 
-    private HealthIndicatorDetails detailsBuilder(@Nullable ProjectEncryptionKeyMetadata metadata, EncryptionServiceState serviceState) {
+    private HealthIndicatorDetails details(
+        @Nullable ProjectEncryptionKeyMetadata metadata,
+        EncryptionServiceState serviceState,
+        Set<String> waitingFor
+    ) {
         String activePasswordId = pekService.getActivePasswordId();
         Map<String, Object> details = new HashMap<>();
         details.put("state", serviceState.displayValue());
         details.put("encryption_required", pekService.isEncryptionRequired());
         details.put("active_password_id", activePasswordId == null ? "(unset)" : activePasswordId);
-        Boolean holdsKeyOnDisk = pekEncryption.gatewayKeys().holdsKeys();
-        if (holdsKeyOnDisk != null) {
-            details.put("key_on_disk", holdsKeyOnDisk);
-            Boolean canReadKeyOnDisk = holdsKeyOnDisk ? pekEncryption.canReadKeyOnDisk() : null;
-            if (canReadKeyOnDisk != null) {
-                details.put("can_read_key_on_disk", canReadKeyOnDisk);
-            }
-            String keyOnDiskPasswordId = pekEncryption.gatewayKeys().passwordId();
-            if (keyOnDiskPasswordId != null) {
-                details.put("key_on_disk_password_id", keyOnDiskPasswordId);
-            }
-        }
-        Set<String> nodesWithoutPassword = this.nodesWithoutPassword.get();
-        if (nodesWithoutPassword.isEmpty() == false) {
-            details.put("nodes_without_password", new TreeSet<>(nodesWithoutPassword));
+        putIfNotNull(details, "key_on_disk", pekEncryption.gatewayKeys().holdsKeys());
+        putIfNotNull(details, "can_read_key_on_disk", pekEncryption.canReadKeyOnDisk());
+        putIfNotNull(details, "key_on_disk_password_id", pekEncryption.gatewayKeys().passwordId());
+        if (waitingFor.isEmpty() == false) {
+            details.put("nodes_without_password", waitingFor);
         }
         if (metadata != null) {
             details.put("metadata_password_id", metadata.getPasswordId());
@@ -276,5 +271,11 @@ class ProjectEncryptionKeyHealthIndicatorService implements HealthIndicatorServi
             details.put("key_count", metadata.getKeys().size());
         }
         return new SimpleHealthIndicatorDetails(details);
+    }
+
+    private static void putIfNotNull(Map<String, Object> details, String name, @Nullable Object value) {
+        if (value != null) {
+            details.put(name, value);
+        }
     }
 }

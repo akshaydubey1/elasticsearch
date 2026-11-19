@@ -97,8 +97,8 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
     }
 
     private static DiscoveryNodes nodes(boolean isLocalMaster) {
-        DiscoveryNode local = DiscoveryNodeUtils.builder("local").name("local").ephemeralId("local").build();
-        DiscoveryNode other = DiscoveryNodeUtils.builder("other").name("other").ephemeralId("other").build();
+        DiscoveryNode local = DiscoveryNodeUtils.builder("local").name("local").ephemeralId("local-ephemeral").build();
+        DiscoveryNode other = DiscoveryNodeUtils.builder("other").name("other").ephemeralId("other-ephemeral").build();
         DiscoveryNodes.Builder builder = DiscoveryNodes.builder().add(local).add(other).localNodeId("local");
         builder.masterNodeId(isLocalMaster ? "local" : "other");
         return builder.build();
@@ -256,72 +256,28 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
 
     /** The master installs the first key only once every node can persist it, and asks again until they can. */
     public void testInstallWaitsUntilEveryNodeCanPersistTheKey() {
-        FeatureService featureService = mock(FeatureService.class);
-        when(featureService.clusterHasFeature(any(), any())).thenReturn(true);
-        ClusterState state = clusterStateWith(null, true);
-        setup(state, 0L, TimeValue.timeValueDays(30), TimeValue.timeValueMinutes(1), featureService);
-        canPersist = node -> node.getId().equals("other") == false;
+        installWaitingForOther().run();
 
-        MockLog.assertThatLogger(
-            () -> coordinator.onClusterStateChanged(new ClusterChangedEvent("test", state, state)),
-            KeyRotationCoordinator.class,
-            new MockLog.SeenEventExpectation(
-                "names the node",
-                KeyRotationCoordinator.class.getName(),
-                Level.WARN,
-                "project encryption key not installed yet: nodes [other] cannot persist it*"
-            )
+        assertEquals(
+            Set.of("local-ephemeral", "other-ephemeral"),
+            submitted("install-project-encryption-key", KeyRotationCoordinator.InstallKeyTask.class).readyNodeIds()
         );
-        verify(taskQueue, never()).submitTask(anyString(), any(), any());
-        assertEquals("reported by the health indicator", Set.of("other"), coordinator.nodesWithoutPassword());
-        ArgumentCaptor<Runnable> retry = ArgumentCaptor.forClass(Runnable.class);
-        verify(threadPool).schedule(retry.capture(), eq(KeyRotationCoordinator.PERSIST_CHECK_RETRY_INTERVAL), any());
-
-        canPersist = node -> true;
-        retry.getValue().run();
-        ArgumentCaptor<KeyRotationCoordinator.KeyRotationTask> install = ArgumentCaptor.forClass(
-            KeyRotationCoordinator.KeyRotationTask.class
-        );
-        verify(taskQueue).submitTask(eq("install-project-encryption-key"), install.capture(), any());
-        assertEquals(Set.of("local", "other"), ((KeyRotationCoordinator.InstallKeyTask) install.getValue()).readyNodeIds());
         assertEquals(Set.of(), coordinator.nodesWithoutPassword());
     }
 
     /** On stateless with passwords from cluster secrets every node has the same password, so the master installs without asking. */
     public void testInstallWithoutAskingNodesWhenPasswordsComeFromClusterSecretsOnStateless() throws IOException {
         nodeSettings = Settings.builder().put(DiscoveryNode.STATELESS_ENABLED_SETTING_NAME, true).build();
-        ClusterState state = clusterStateWithPasswordInClusterSecrets();
-        canPersist = node -> false;
-
-        coordinator.onClusterStateChanged(new ClusterChangedEvent("test", state, state));
-
-        ArgumentCaptor<KeyRotationCoordinator.KeyRotationTask> install = ArgumentCaptor.forClass(
-            KeyRotationCoordinator.KeyRotationTask.class
-        );
-        verify(taskQueue).submitTask(eq("install-project-encryption-key"), install.capture(), any());
-        assertNull(((KeyRotationCoordinator.InstallKeyTask) install.getValue()).readyNodeIds());
-    }
-
-    /** On stateful a node persists a cluster state before its cluster secrets reach it, so nodes are still asked. */
-    public void testStatefulAsksNodesEvenWhenPasswordsComeFromClusterSecrets() throws IOException {
-        ClusterState state = clusterStateWithPasswordInClusterSecrets();
-        canPersist = node -> false;
-
-        coordinator.onClusterStateChanged(new ClusterChangedEvent("test", state, state));
-
-        verify(taskQueue, never()).submitTask(anyString(), any(), any());
-        verify(threadPool).schedule(any(), eq(KeyRotationCoordinator.PERSIST_CHECK_RETRY_INTERVAL), any());
-    }
-
-    private ClusterState clusterStateWithPasswordInClusterSecrets() throws IOException {
-        FeatureService featureService = mock(FeatureService.class);
-        when(featureService.clusterHasFeature(any(), any())).thenReturn(true);
         ClusterState state = PasswordPekEncryptionTests.withClusterSecrets(
             clusterStateWith(null, true),
             ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY
         );
-        setup(state, 0L, TimeValue.timeValueDays(30), TimeValue.timeValueMinutes(1), featureService);
-        return state;
+        setup(state, 0L, TimeValue.timeValueDays(30), TimeValue.timeValueMinutes(1), featureAvailable());
+        canPersist = node -> false;
+
+        coordinator.onClusterStateChanged(new ClusterChangedEvent("test", state, state));
+
+        assertNull(submitted("install-project-encryption-key", KeyRotationCoordinator.InstallKeyTask.class).readyNodeIds());
     }
 
     /** A node that persists cluster state restarting, here with a password, ends the wait for the retry. */
@@ -350,30 +306,19 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
         verify(taskQueue, times(1)).submitTask(anyString(), any(), any());
     }
 
-    /**
-     * Starts an install that waits because node "other" cannot persist the key, then lets every node persist it. Returns the retry
-     * scheduled after {@link KeyRotationCoordinator#PERSIST_CHECK_RETRY_INTERVAL}.
-     */
+    /** Starts an install that waits for node "other", as {@link #waitingForOther}. */
     private Runnable installWaitingForOther() {
-        FeatureService featureService = mock(FeatureService.class);
-        when(featureService.clusterHasFeature(any(), any())).thenReturn(true);
         ClusterState state = clusterStateWith(null, true);
-        setup(state, 0L, TimeValue.timeValueDays(30), TimeValue.timeValueMinutes(1), featureService);
-        canPersist = node -> node.getId().equals("other") == false;
-        coordinator.onClusterStateChanged(new ClusterChangedEvent("test", state, state));
-        verify(taskQueue, never()).submitTask(anyString(), any(), any());
-        ArgumentCaptor<Runnable> retry = ArgumentCaptor.forClass(Runnable.class);
-        verify(threadPool).schedule(retry.capture(), eq(KeyRotationCoordinator.PERSIST_CHECK_RETRY_INTERVAL), any());
-        canPersist = node -> true;
-        return retry.getValue();
+        setup(state, 0L, TimeValue.timeValueDays(30), TimeValue.timeValueMinutes(1), featureAvailable());
+        return waitingForOther(state, "installed");
     }
 
-    /** An elected master without the key restores it from its own copy on disk once every node can persist it. */
-    public void testElectedMasterWithoutKeyRestoresItFromItsOwnDisk() {
-        byte[] keyBytes = randomKey();
-        ClusterState state = masterWithoutKeyAndACopyOnDisk(keyBytes);
+    /**
+     * Applies {@code state} while node "other" cannot persist the key, so that nothing is submitted, then lets every node persist it.
+     * Returns the retry scheduled after {@link KeyRotationCoordinator#PERSIST_CHECK_RETRY_INTERVAL}.
+     */
+    private Runnable waitingForOther(ClusterState state, String pending) {
         canPersist = node -> node.getId().equals("other") == false;
-
         MockLog.assertThatLogger(
             () -> coordinator.onClusterStateChanged(new ClusterChangedEvent("test", state, state)),
             KeyRotationCoordinator.class,
@@ -381,22 +326,42 @@ public class KeyRotationCoordinatorTests extends ESTestCase {
                 "names the node",
                 KeyRotationCoordinator.class.getName(),
                 Level.WARN,
-                "project encryption key not restored yet: nodes [other] cannot persist it*"
+                "project encryption key not " + pending + " yet: nodes [other] cannot persist it*"
             )
         );
         verify(taskQueue, never()).submitTask(anyString(), any(), any());
+        assertEquals("reported by the health indicator", Set.of("other"), coordinator.nodesWithoutPassword());
         ArgumentCaptor<Runnable> retry = ArgumentCaptor.forClass(Runnable.class);
         verify(threadPool).schedule(retry.capture(), eq(KeyRotationCoordinator.PERSIST_CHECK_RETRY_INTERVAL), any());
-
         canPersist = node -> true;
-        retry.getValue().run();
-        ArgumentCaptor<KeyRotationCoordinator.KeyRotationTask> restore = ArgumentCaptor.forClass(
-            KeyRotationCoordinator.KeyRotationTask.class
+        return retry.getValue();
+    }
+
+    private <T extends KeyRotationCoordinator.KeyRotationTask> T submitted(String source, Class<T> taskClass) {
+        ArgumentCaptor<KeyRotationCoordinator.KeyRotationTask> task = ArgumentCaptor.forClass(KeyRotationCoordinator.KeyRotationTask.class);
+        verify(taskQueue).submitTask(eq(source), task.capture(), any());
+        return taskClass.cast(task.getValue());
+    }
+
+    private static FeatureService featureAvailable() {
+        FeatureService featureService = mock(FeatureService.class);
+        when(featureService.clusterHasFeature(any(), any())).thenReturn(true);
+        return featureService;
+    }
+
+    /** An elected master without the key restores it from its own copy on disk once every node can persist it. */
+    public void testElectedMasterWithoutKeyRestoresItFromItsOwnDisk() {
+        byte[] keyBytes = randomKey();
+        ClusterState state = masterWithoutKeyAndACopyOnDisk(keyBytes);
+
+        waitingForOther(state, "restored").run();
+
+        KeyRotationCoordinator.RestoreKeysTask task = submitted(
+            "restore-project-encryption-keys",
+            KeyRotationCoordinator.RestoreKeysTask.class
         );
-        verify(taskQueue).submitTask(eq("restore-project-encryption-keys"), restore.capture(), any());
-        KeyRotationCoordinator.RestoreKeysTask task = (KeyRotationCoordinator.RestoreKeysTask) restore.getValue();
         assertArrayEquals(keyBytes, task.keys().getKeys().get("k1").bytes());
-        assertEquals(Set.of("local", "other"), task.readyNodeIds());
+        assertEquals(Set.of("local-ephemeral", "other-ephemeral"), task.readyNodeIds());
     }
 
     private ClusterState masterWithoutKeyAndACopyOnDisk(byte[] keyBytes) {
