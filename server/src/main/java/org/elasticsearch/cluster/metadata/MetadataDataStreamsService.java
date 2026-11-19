@@ -511,15 +511,9 @@ public class MetadataDataStreamsService {
         final ComposableIndexTemplate template = lookupTemplateForDataStream(dataStreamName, projectMetadata);
         Settings templateSettings = MetadataIndexTemplateService.resolveSettings(template, projectMetadata.componentTemplates());
         Settings mergedEffectiveSettings = templateSettings.merge(mergedDataStreamSettings);
-        CompressedXContent effectiveMappings = dataStream.getEffectiveMappings(projectMetadata, indicesService);
+        CompressedXContent effectiveMappings = dataStream.getEffectiveMappings(projectMetadata, indicesService, indexSettingProviders);
         MetadataIndexTemplateService.validateTemplate(
-            addSettingsFromIndexSettingProviders(
-                dataStreamName,
-                template.isRegistryInstalled(),
-                effectiveMappings,
-                projectMetadata,
-                mergedEffectiveSettings
-            ),
+            addSettingsFromIndexSettingProviders(dataStreamName, template, effectiveMappings, projectMetadata, mergedEffectiveSettings),
             effectiveMappings,
             indicesService,
             dataStreamName
@@ -530,7 +524,7 @@ public class MetadataDataStreamsService {
 
     private Settings addSettingsFromIndexSettingProviders(
         String dataStreamName,
-        boolean registryInstalledTemplate,
+        ComposableIndexTemplate template,
         CompressedXContent effectiveMappings,
         ProjectMetadata projectMetadata,
         Settings settings
@@ -539,8 +533,9 @@ public class MetadataDataStreamsService {
             indexSettingProviders.getIndexSettingProviders(),
             dataStreamName,
             dataStreamName,
-            projectMetadata.dataStreams().get(dataStreamName).getIndexMode(),
-            registryInstalledTemplate,
+            // The template's mode, as on rollover. The data stream's mode is the write index's mode, which the template may have changed.
+            projectMetadata.retrieveIndexModeFromTemplate(template),
+            template.isRegistryInstalled(),
             projectMetadata,
             Instant.now(),
             settings,
@@ -564,8 +559,9 @@ public class MetadataDataStreamsService {
             projectMetadata,
             template,
             mappingsOverrides,
-            dataStream.getWriteIndex(),
-            indicesService
+            dataStream,
+            indicesService,
+            indexSettingProviders
         );
         MetadataIndexTemplateService.validateTemplate(
             getEffectiveSettings(projectMetadata, dataStream, mappingsOverrides),
@@ -609,12 +605,13 @@ public class MetadataDataStreamsService {
             projectMetadata,
             template,
             mappingOverrides,
-            dataStream.getWriteIndex(),
-            indicesService
+            dataStream,
+            indicesService,
+            indexSettingProviders
         );
         return addSettingsFromIndexSettingProviders(
             dataStream.getName(),
-            template.isRegistryInstalled(),
+            template,
             effectiveMappings,
             projectMetadata,
             templateSettings.merge(dataStream.getSettings())
