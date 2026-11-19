@@ -1428,7 +1428,12 @@ public final class RestoreService implements ClusterStateApplier {
         }
     }
 
-    public record RestoreCompletionResponse(String uuid, Snapshot snapshot, RestoreInfo restoreInfo) {}
+    /**
+     * Result of starting a restore.
+     *
+     * @param restoreInfo the outcome if all shard statuses were final at initialization, or {@code null} if shard results were pending
+     */
+    public record RestoreCompletionResponse(String uuid, Snapshot snapshot, @Nullable RestoreInfo restoreInfo) {}
 
     public static class RestoreInProgressUpdater implements RoutingChangesObserver {
         // Map of RestoreUUID to a of changes to the shards' restore statuses
