@@ -764,12 +764,7 @@ public class EsqlStreamResponseListenerTests extends ESTestCase {
         private final List<Integer> storedSeqs = new ArrayList<>();
         private final Deque<Runnable> heldCapacity = new ArrayDeque<>();
         private boolean holdCapacity;
-        private int terminalCalls;
         private StreamMetadata metadata;
-        private String status = "RUNNING";
-        private long completedPages;
-        private long completedRows;
-        private Exception failure;
 
         void holdCapacity() {
             holdCapacity = true;
@@ -804,58 +799,25 @@ public class EsqlStreamResponseListenerTests extends ESTestCase {
 
         @Override
         public void markComplete(boolean partial, long tookMillis, long pages, long rows) {
-            terminalCalls++;
             metadata = metadata.complete(partial, tookMillis, pages, rows);
-            status = "COMPLETE";
-            completedPages = pages;
-            completedRows = rows;
         }
 
         @Override
         public void markFailed(boolean partial, long tookMillis, Exception e) {
-            terminalCalls++;
             metadata = metadata.failed(partial, tookMillis, e);
-            status = "FAILED";
-            failure = e;
         }
 
         @Override
         public void markCanceled() {
-            terminalCalls++;
             metadata = metadata.canceled();
-            status = "CANCELED";
         }
 
         StreamMetadata metadata() {
             return metadata;
         }
 
-        String streamId() {
-            return metadata.streamId();
-        }
-
-        String status() {
-            return status;
-        }
-
         List<Integer> storedSeqs() {
             return storedSeqs;
-        }
-
-        int terminalCalls() {
-            return terminalCalls;
-        }
-
-        long completedPages() {
-            return completedPages;
-        }
-
-        long completedRows() {
-            return completedRows;
-        }
-
-        String failureType() {
-            return ElasticsearchException.getExceptionName(ExceptionsHelper.unwrapCause(failure));
         }
     }
 
@@ -1108,10 +1070,9 @@ public class EsqlStreamResponseListenerTests extends ESTestCase {
     }
 
     private static void assertCompleted(RecordingStreamWriter writer, long pages, long rows) {
-        assertThat(writer.status(), equalTo("COMPLETE"));
-        assertThat(writer.completedPages(), equalTo(pages));
-        assertThat(writer.completedRows(), equalTo(rows));
-        assertThat("a stream gets exactly one terminal call", writer.terminalCalls(), equalTo(1));
+        assertThat(writer.metadata().status(), equalTo(StreamMetadata.Status.COMPLETE));
+        assertThat(writer.metadata().completionInfo().pages(), equalTo(pages));
+        assertThat(writer.metadata().completionInfo().rows(), equalTo(rows));
     }
 
     public void testNoneNeverTouchesTheWriter() throws IOException {
@@ -1180,7 +1141,7 @@ public class EsqlStreamResponseListenerTests extends ESTestCase {
 
         assertThat(drained.footer().get("complete"), equalTo(true));
         assertThat(writer.storedSeqs(), equalTo(List.of()));
-        assertThat(s.response().getHeaders().get(STREAM_ID_HEADER), equalTo(List.of(writer.streamId())));
+        assertThat(s.response().getHeaders().get(STREAM_ID_HEADER), equalTo(List.of(writer.metadata().streamId())));
         assertCompleted(writer, 2, 4);
     }
 
@@ -1305,9 +1266,8 @@ public class EsqlStreamResponseListenerTests extends ESTestCase {
 
         s.publisher().failStream(new RuntimeException("boom"));
 
-        assertThat(writer.status(), equalTo("FAILED"));
-        assertThat(writer.failureType(), equalTo("runtime_exception"));
-        assertThat(writer.terminalCalls(), equalTo(1));
+        assertThat(writer.metadata().status(), equalTo(StreamMetadata.Status.FAILED));
+        assertThat(writer.metadata().completionInfo().failure().type(), equalTo("runtime_exception"));
         assertThat(writer.storedSeqs(), equalTo(List.of(0, 1)));
     }
 
@@ -1318,9 +1278,8 @@ public class EsqlStreamResponseListenerTests extends ESTestCase {
         s.publisher().failStream(new ElasticsearchStatusException("not allowed", RestStatus.FORBIDDEN));
 
         assertThat(s.response().status(), equalTo(RestStatus.FORBIDDEN));
-        assertThat(writer.status(), equalTo("FAILED"));
-        assertThat(writer.failureType(), equalTo("status_exception"));
-        assertThat(writer.terminalCalls(), equalTo(1));
+        assertThat(writer.metadata().status(), equalTo(StreamMetadata.Status.FAILED));
+        assertThat(writer.metadata().completionInfo().failure().type(), equalTo("status_exception"));
         assertThat(writer.storedSeqs(), equalTo(List.of()));
     }
 
@@ -1330,8 +1289,7 @@ public class EsqlStreamResponseListenerTests extends ESTestCase {
 
         s.publisher().failStream(new TaskCancelledException("cancelled"));
 
-        assertThat(writer.status(), equalTo("CANCELED"));
-        assertThat(writer.terminalCalls(), equalTo(1));
+        assertThat(writer.metadata().status(), equalTo(StreamMetadata.Status.CANCELED));
     }
 
     public void testWriterCapacityGatesTheStoringOfSkippedPages() throws IOException {
@@ -1352,7 +1310,11 @@ public class EsqlStreamResponseListenerTests extends ESTestCase {
         assertThat(writer.storedSeqs(), equalTo(List.of(0, 1, 2)));
 
         completeStream(s);
-        assertThat("the end of the stream is only requested once the writer has capacity", writer.status(), equalTo("RUNNING"));
+        assertThat(
+            "the end of the stream is only requested once the writer has capacity",
+            writer.metadata().status(),
+            equalTo(StreamMetadata.Status.RUNNING)
+        );
         writer.releaseCapacity();
         assertCompleted(writer, 3, 7);
     }
@@ -1389,7 +1351,7 @@ public class EsqlStreamResponseListenerTests extends ESTestCase {
         Subscribed s = subscribe(storing(StreamOptions.Store.OVERFLOW, StreamOptions.NO_LIMIT, StreamOptions.NO_LIMIT), writer);
         drainStream(s, List.of(), 5L, List.of());
 
-        assertThat(s.response().getHeaders().get(STREAM_ID_HEADER), equalTo(List.of(writer.streamId())));
+        assertThat(s.response().getHeaders().get(STREAM_ID_HEADER), equalTo(List.of(writer.metadata().streamId())));
         assertThat(writer.metadata().taskId(), equalTo(TaskId.EMPTY_TASK_ID));
         assertThat(writer.metadata().columns().stream().map(ColumnInfo::name).toList(), equalTo(List.of("id", "name")));
     }
