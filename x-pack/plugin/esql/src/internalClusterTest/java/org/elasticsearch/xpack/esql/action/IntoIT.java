@@ -8,13 +8,16 @@
 package org.elasticsearch.xpack.esql.action;
 
 import org.elasticsearch.ElasticsearchStatusException;
+import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.CollectionUtils;
 import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.rest.RestStatus;
 import org.elasticsearch.search.SearchHit;
+import org.elasticsearch.test.ESIntegTestCase;
+import org.elasticsearch.test.FailingFieldPlugin;
 import org.elasticsearch.test.transport.MockTransportService;
-import org.elasticsearch.xpack.esql.VerificationException;
 import org.elasticsearch.xpack.esql.plugin.ComputeService;
+import org.elasticsearch.xpack.esql.plugin.QueryPragmas;
 import org.junit.Before;
 
 import java.util.Arrays;
@@ -22,6 +25,8 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertResponse;
@@ -31,31 +36,39 @@ import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
 
+@ESIntegTestCase.ClusterScope(minNumDataNodes = 2)
 public class IntoIT extends AbstractEsqlIntegTestCase {
 
     private static final String DESTINATION = "dest-into";
+    private static final String SOURCE = "src-into";
+    private static final String FAILING_SOURCE = "src-into-failing";
+    private static final String RETRY_SOURCE = "src-into-retry";
+    private static final String MAPPING = """
+        {
+          "dynamic": "strict",
+          "properties": {
+            "k":  { "type": "keyword" },
+            "l":  { "type": "long" },
+            "d":  { "type": "double" },
+            "b":  { "type": "boolean" },
+            "dt": { "type": "date" },
+            "ip": { "type": "ip" }
+          }
+        }
+        """;
 
     @Override
     protected Collection<Class<? extends Plugin>> nodePlugins() {
-        return CollectionUtils.appendToCopy(super.nodePlugins(), MockTransportService.TestPlugin.class);
+        return CollectionUtils.appendToCopy(
+            CollectionUtils.appendToCopy(super.nodePlugins(), MockTransportService.TestPlugin.class),
+            FailingFieldPlugin.class
+        );
     }
 
     @Before
     public void createDestination() {
         assumeTrue("INTO is only enabled in snapshot builds", EsqlCapabilities.Cap.INTO_COMMAND.isEnabled());
-        assertAcked(indicesAdmin().prepareCreate(DESTINATION).setMapping("""
-            {
-              "dynamic": "strict",
-              "properties": {
-                "k":  { "type": "keyword" },
-                "l":  { "type": "long" },
-                "d":  { "type": "double" },
-                "b":  { "type": "boolean" },
-                "dt": { "type": "date" },
-                "ip": { "type": "ip" }
-              }
-            }
-            """));
+        assertAcked(indicesAdmin().prepareCreate(DESTINATION).setMapping(MAPPING));
     }
 
     public void testTypes() {
@@ -118,13 +131,86 @@ public class IntoIT extends AbstractEsqlIntegTestCase {
         assertThat(e.getMessage(), containsString("unmapped_col"));
     }
 
-    public void testAllowPartialResultsDoesNotBypassRejectionOrRowFailure() {
-        VerificationException rejected = expectThrows(
-            VerificationException.class,
-            () -> run(syncEsqlQueryRequest("FROM " + DESTINATION + " | INTO " + DESTINATION).allowPartialResults(true)).close()
+    public void testFromSource() {
+        createSource();
+        assertInto("FROM " + SOURCE, 3);
+        assertReadBack(
+            "SORT k",
+            List.of(
+                List.of(true, 1.5, "2026-01-15T12:34:56.789Z", "192.168.1.1", "a", 1L),
+                List.of(false, 2.5, "2026-01-16T12:34:56.789Z", "192.168.1.2", "b", 2L),
+                List.of(true, 3.5, "2026-01-17T12:34:56.789Z", "192.168.1.3", "c", 3L)
+            )
         );
-        assertThat(rejected.getMessage(), containsString("INTO currently only supports ROW as a source, without FORK"));
+    }
 
+    public void testFromWithCommandsBeforeInto() {
+        createSource();
+        assertInto("FROM " + SOURCE + " | WHERE l > 1 | EVAL d = l * 10.0 | KEEP k, d", 2);
+        assertReadBack("KEEP k, d, l | SORT k", List.of(Arrays.asList("b", 20.0, null), Arrays.asList("c", 30.0, null)));
+    }
+
+    public void testFromStatsInto() {
+        createSource();
+        assertInto("FROM " + SOURCE + " | STATS l = SUM(l) BY b | EVAL k = TO_STRING(b)", 2);
+        assertReadBack("KEEP k, l | SORT k", List.of(List.of("false", 2L), List.of("true", 4L)));
+    }
+
+    public void testManyRowsFromManyShardsAreAllWritten() {
+        String wide = "x".repeat(4096);
+        assertAcked(indicesAdmin().prepareCreate(SOURCE).setSettings(indexSettings(5, 0)).setMapping(MAPPING));
+        indexRandom(
+            true,
+            IntStream.range(0, 2000).mapToObj(i -> client().prepareIndex(SOURCE).setSource("k", wide + i)).collect(Collectors.toList())
+        );
+        assertInto("FROM " + SOURCE + " | KEEP k", 2000);
+        assertReadBack("STATS c = COUNT(*), d = COUNT_DISTINCT(k)", List.of(List.of(2000L, 2000L)));
+    }
+
+    public void testFromShardFailureFailsEvenWithPartialResults() {
+        // The failing index has no @timestamp, so it sorts first on its node and no row may be written after it
+        String node = clusterService().state().nodes().getDataNodes().values().iterator().next().getName();
+        Settings.Builder onNode = indexSettings(1, 0).put("index.routing.allocation.require._name", node);
+        assertAcked(indicesAdmin().prepareCreate(FAILING_SOURCE).setSettings(onNode).setMapping("""
+            {
+              "runtime": {
+                "fail_me": { "type": "long", "script": { "source": "", "lang": "failing_field" } }
+              },
+              "properties": { "k": { "type": "keyword" } }
+            }
+            """));
+        indexRandom(true, client().prepareIndex(FAILING_SOURCE).setSource("k", "boom"));
+        createSource(onNode, MAPPING.replace("\"k\":", "\"@timestamp\": { \"type\": \"date\" }, \"k\":"));
+        EsqlQueryRequest request = syncEsqlQueryRequest(
+            "FROM " + SOURCE + "," + FAILING_SOURCE + " | EVAL l = COALESCE(fail_me, l) | KEEP k, l | INTO " + DESTINATION
+        ).allowPartialResults(true)
+            .pragmas(new QueryPragmas(Settings.builder().put(QueryPragmas.MAX_CONCURRENT_SHARDS_PER_NODE.getKey(), 1).build()))
+            .acceptedPragmaRisks(true);
+        IllegalStateException e = expectThrows(IllegalStateException.class, () -> run(request).close());
+        assertThat(e.getMessage(), equalTo("Accessing failing field"));
+        assertReadBack(List.of());
+    }
+
+    public void testShardFailureAfterBulkIsNotRetried() {
+        // The destination's strict mapping refuses "extra", so the bulk writes "a" and fails on "b"
+        assertAcked(indicesAdmin().prepareCreate(RETRY_SOURCE).setSettings(indexSettings(1, 1)).setMapping("""
+            { "properties": { "k": { "type": "keyword" }, "extra": { "type": "keyword" } } }
+            """));
+        indexRandom(
+            true,
+            client().prepareIndex(RETRY_SOURCE).setSource("k", "a"),
+            client().prepareIndex(RETRY_SOURCE).setSource("k", "b", "extra", "boom")
+        );
+        ensureGreen(RETRY_SOURCE);
+        ElasticsearchStatusException e = expectThrows(
+            ElasticsearchStatusException.class,
+            () -> run("FROM " + RETRY_SOURCE + " | KEEP k, extra | INTO " + DESTINATION).close()
+        );
+        assertThat(e.getMessage(), containsString("extra"));
+        assertReadBack("KEEP k", List.of(List.of("a")));
+    }
+
+    public void testAllowPartialResultsDoesNotBypassRowFailure() {
         ElasticsearchStatusException failed = expectThrows(
             ElasticsearchStatusException.class,
             () -> run(syncEsqlQueryRequest("ROW k = \"ok\", unmapped_col = \"nope\" | INTO " + DESTINATION).allowPartialResults(true))
@@ -135,6 +221,11 @@ public class IntoIT extends AbstractEsqlIntegTestCase {
     }
 
     public void testIntoRunsOnCoordinatorWithoutDataNodeRequests() {
+        assertThat(countDataNodeRequests(() -> assertInto("ROW k = [\"r1\", \"r2\"] | MV_EXPAND k", 2)), equalTo(0));
+        assertReadBack("KEEP k | SORT k", List.of(List.of("r1"), List.of("r2")));
+    }
+
+    private int countDataNodeRequests(Runnable action) {
         AtomicInteger dataNodeRequests = new AtomicInteger();
         for (String node : internalCluster().getNodeNames()) {
             MockTransportService.getInstance(node)
@@ -144,14 +235,30 @@ public class IntoIT extends AbstractEsqlIntegTestCase {
                 });
         }
         try {
-            assertInto("ROW k = [\"r1\", \"r2\"] | MV_EXPAND k", 2);
-            assertThat(dataNodeRequests.get(), equalTo(0));
+            action.run();
         } finally {
             for (String node : internalCluster().getNodeNames()) {
                 MockTransportService.getInstance(node).clearAllRules();
             }
         }
-        assertReadBack("KEEP k | SORT k", List.of(List.of("r1"), List.of("r2")));
+        return dataNodeRequests.get();
+    }
+
+    private void createSource() {
+        createSource(indexSettings(between(2, 5), 0), MAPPING);
+    }
+
+    private void createSource(Settings.Builder settings, String mapping) {
+        assertAcked(indicesAdmin().prepareCreate(SOURCE).setSettings(settings).setMapping(mapping));
+        indexRandom(
+            true,
+            client().prepareIndex(SOURCE)
+                .setSource("k", "a", "l", 1, "d", 1.5, "b", true, "dt", "2026-01-15T12:34:56.789Z", "ip", "192.168.1.1"),
+            client().prepareIndex(SOURCE)
+                .setSource("k", "b", "l", 2, "d", 2.5, "b", false, "dt", "2026-01-16T12:34:56.789Z", "ip", "192.168.1.2"),
+            client().prepareIndex(SOURCE)
+                .setSource("k", "c", "l", 3, "d", 3.5, "b", true, "dt", "2026-01-17T12:34:56.789Z", "ip", "192.168.1.3")
+        );
     }
 
     private void assertInto(String producer, long rows) {

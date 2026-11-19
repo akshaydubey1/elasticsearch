@@ -17,6 +17,8 @@ import org.elasticsearch.xpack.esql.plan.logical.Row;
 import org.elasticsearch.xpack.esql.plan.logical.local.LocalRelation;
 import org.junit.Before;
 
+import java.util.List;
+
 import static org.elasticsearch.xpack.esql.EsqlTestUtils.analyzer;
 import static org.elasticsearch.xpack.esql.EsqlTestUtils.as;
 import static org.hamcrest.Matchers.containsString;
@@ -34,9 +36,10 @@ public class IntoAnalysisTests extends AnalyzerTestCase {
     }
 
     public void testNoImplicitLimitAdded() {
-        LogicalPlan plan = analyzer().query("ROW a = 1 | INTO dst");
-        Into into = as(plan, Into.class);
-        assertThat(into.collectFirstChildren(Limit.class::isInstance), empty());
+        for (String query : List.of("ROW a = 1 | INTO dst", "FROM employees | KEEP emp_no | INTO dst")) {
+            Into into = as(analyzer().addEmployees().query(query), Into.class);
+            assertThat(into.collectFirstChildren(Limit.class::isInstance), empty());
+        }
     }
 
     public void testDescribeAfterIntoIsRejected() {
@@ -62,10 +65,10 @@ public class IntoAnalysisTests extends AnalyzerTestCase {
         analyzer().error("ROW a = 1 | FORK (INTO dst) (LIMIT 1)", containsString(error));
     }
 
-    public void testOnlyRowSource() {
-        String error = "INTO currently only supports ROW as a source, without FORK";
-        analyzer().addEmployees().error("FROM employees | INTO dst", containsString(error));
+    public void testUnsupportedSources() {
+        String error = "INTO currently only supports ROW or local FROM as a source, without FORK";
         analyzer().addK8s().error("TS k8s | INTO dst", containsString(error));
+        analyzer().addIndex("remote:employees", "mapping-default.json").error("FROM remote:employees | INTO dst", containsString(error));
         analyzer().error("ROW a = 1 | FORK (WHERE true) (WHERE false) | INTO dst", containsString(error));
     }
 
@@ -76,8 +79,10 @@ public class IntoAnalysisTests extends AnalyzerTestCase {
         assertThat(into.child().anyMatch(LocalRelation.class::isInstance), equalTo(true));
         assertThat(into.child().anyMatch(Row.class::isInstance), equalTo(false));
 
-        String error = "INTO currently only supports ROW as a source, without FORK";
+        String error = Into.UNSUPPORTED_SOURCE_BELOW_DESCRIBE;
         analyzer().addEmployees().error("FROM employees | DESCRIBE | INTO dst", containsString(error));
+        analyzer().addIndex("remote:employees", "mapping-default.json")
+            .error("FROM remote:employees | DESCRIBE | INTO dst", containsString(error));
         analyzer().error("ROW a = 1 | FORK (WHERE true) (WHERE false) | DESCRIBE | INTO dst", containsString(error));
     }
 }

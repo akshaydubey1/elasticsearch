@@ -9,6 +9,7 @@ package org.elasticsearch.xpack.esql.plan.logical;
 import org.elasticsearch.common.io.stream.NamedWriteableRegistry;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.transport.RemoteClusterAware;
 import org.elasticsearch.xpack.esql.capabilities.PostAnalysisPlanVerificationAware;
 import org.elasticsearch.xpack.esql.capabilities.PostAnalysisVerificationAware;
 import org.elasticsearch.xpack.esql.capabilities.TelemetryAware;
@@ -26,6 +27,7 @@ import org.elasticsearch.xpack.esql.plan.logical.local.LocalRelation;
 import java.io.IOException;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.BiConsumer;
 
 import static org.elasticsearch.xpack.esql.common.Failure.fail;
@@ -42,7 +44,13 @@ public class Into extends UnaryPlan
         PipelineBreaker,
         PostAnalysisPlanVerificationAware,
         PostAnalysisVerificationAware {
+    public static final String UNSUPPORTED_SOURCE = "INTO currently only supports ROW or local FROM as a source, without FORK";
+    public static final String UNSUPPORTED_SOURCE_BELOW_DESCRIBE =
+        "INTO after DESCRIBE currently only supports ROW as a source, without FORK";
+
     public static final NamedWriteableRegistry.Entry ENTRY = new NamedWriteableRegistry.Entry(LogicalPlan.class, "Into", Into::new);
+
+    private static final Set<String> LOCAL_ONLY = Set.of(RemoteClusterAware.LOCAL_CLUSTER_GROUP_KEY);
 
     private final String destination;
     private final List<Attribute> output;
@@ -51,15 +59,23 @@ public class Into extends UnaryPlan
         this(source, child, destination, IntoStats.createAttributes(source));
     }
 
-    private Into(Source source, LogicalPlan child, String destination, List<Attribute> output) {
+    public Into(Source source, LogicalPlan child, String destination, List<Attribute> output) {
         super(source, child);
         this.destination = Objects.requireNonNull(destination);
         this.output = output;
     }
 
+    /**
+     * Reads the output too, rather than minting new {@code [total, created]} attributes: the coordinator plan built around this
+     * node refers to them by id.
+     */
     private Into(StreamInput in) throws IOException {
-        // TODO: once FROM supports INTO, align regenerated output NameIds with ProjectAwayColumns and ComputeService.reductionPlan
-        this(Source.readFrom((PlanStreamInput) in), in.readNamedWriteable(LogicalPlan.class), in.readString());
+        this(
+            Source.readFrom((PlanStreamInput) in),
+            in.readNamedWriteable(LogicalPlan.class),
+            in.readString(),
+            in.readNamedWriteableCollectionAsList(Attribute.class)
+        );
     }
 
     @Override
@@ -67,6 +83,7 @@ public class Into extends UnaryPlan
         Source.EMPTY.writeTo(out);
         out.writeNamedWriteable(child());
         out.writeString(destination);
+        out.writeNamedWriteableCollection(output);
     }
 
     @Override
@@ -95,7 +112,7 @@ public class Into extends UnaryPlan
 
     @Override
     protected NodeInfo<? extends LogicalPlan> info() {
-        return NodeInfo.create(this, Into::new, child(), destination);
+        return NodeInfo.create(this, Into::new, child(), destination, output);
     }
 
     @Override
@@ -115,32 +132,32 @@ public class Into extends UnaryPlan
         };
     }
 
-    /**
-     * A {@link LocalRelation} is a ROW producer that analysis already materialized, for example {@code DESCRIBE}.
-     * Pass {@code false} while the original producer is still in the plan.
-     */
-    public static boolean unsupportedSource(LogicalPlan child, boolean allowMaterializedRow) {
-        return child.anyMatch(p -> {
-            if (p instanceof MergePlan) {
-                return true;
-            }
-            if (p instanceof LeafPlan == false || p instanceof Row) {
-                return false;
-            }
-            if (allowMaterializedRow && p instanceof LocalRelation) {
-                return false;
-            }
-            return true;
-        });
+    /** A {@link LocalRelation} is a ROW producer that analysis already materialized, for example {@code DESCRIBE}. */
+    public static boolean unsupportedSource(LogicalPlan child) {
+        return child.anyMatch(
+            p -> p instanceof MergePlan || (p instanceof LeafPlan && isSupportedSource(p) == false && p instanceof LocalRelation == false)
+        );
+    }
+
+    /** {@code DESCRIBE} replaces its producer with a {@link LocalRelation}, so only a ROW producer is accepted below it. */
+    public static boolean unsupportedSourceBelowDescribe(LogicalPlan child) {
+        return child.anyMatch(p -> p instanceof MergePlan || (p instanceof LeafPlan && p instanceof Row == false));
     }
 
     @Override
     public void postAnalysisVerification(Failures failures) {
-        // TODO: once FROM is supported, gate Into on a minimum TransportVersion in Verifier for mixed-version clusters
+        // TODO: before INTO leaves snapshot, gate Into on a minimum TransportVersion in Verifier for mixed-version clusters
         // RejectUnsupportedIntoSource already saw the original producer. DESCRIBE has since replaced it with a LocalRelation.
-        if (unsupportedSource(child(), true)) {
-            failures.add(fail(this, "INTO currently only supports ROW as a source, without FORK"));
+        if (unsupportedSource(child())) {
+            failures.add(fail(this, UNSUPPORTED_SOURCE));
         }
+    }
+
+    private static boolean isSupportedSource(LogicalPlan leaf) {
+        return leaf instanceof Row
+            || (leaf instanceof EsRelation relation
+                && relation.indexMode().isTsdb() == false
+                && LOCAL_ONLY.containsAll(relation.originalIndices().keySet()));
     }
 
     @Override
@@ -150,11 +167,11 @@ public class Into extends UnaryPlan
 
     @Override
     public int hashCode() {
-        return Objects.hash(super.hashCode(), destination);
+        return Objects.hash(super.hashCode(), destination, output);
     }
 
     @Override
     public boolean equals(Object obj) {
-        return super.equals(obj) && destination.equals(((Into) obj).destination);
+        return super.equals(obj) && destination.equals(((Into) obj).destination) && output.equals(((Into) obj).output);
     }
 }

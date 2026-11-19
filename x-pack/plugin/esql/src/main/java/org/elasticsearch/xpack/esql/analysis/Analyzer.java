@@ -407,13 +407,6 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
         this.verifier = verifier;
     }
 
-    /**
-     * Runs the analysis rules and returns the plan without verification, so a test can record that plan.
-     */
-    public LogicalPlan analyzeWithoutVerification(LogicalPlan plan) {
-        return execute(plan);
-    }
-
     public LogicalPlan analyze(LogicalPlan plan) {
         BitSet partialMetrics = new BitSet(FeatureMetric.values().length);
         LogicalPlan analyzed = execute(plan);
@@ -478,8 +471,8 @@ public class Analyzer extends ParameterizedRuleExecutor<LogicalPlan, AnalyzerCon
 
         @Override
         protected LogicalPlan rule(Into into) {
-            if (into.child().anyMatch(Describe.class::isInstance) && Into.unsupportedSource(into.child(), false)) {
-                throw new VerificationException(List.of(Failure.fail(into, "INTO currently only supports ROW as a source, without FORK")));
+            if (into.child().anyMatch(Describe.class::isInstance) && Into.unsupportedSourceBelowDescribe(into.child())) {
+                throw new VerificationException(List.of(Failure.fail(into, Into.UNSUPPORTED_SOURCE_BELOW_DESCRIBE)));
             }
             return into;
         }
