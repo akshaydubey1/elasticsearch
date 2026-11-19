@@ -1,3 +1,6 @@
+# TARGET_BRANCH unset (lucene_snapshot): upload + push version bump + tests.
+# TARGET_BRANCH set (main → lucene_snapshot_11): S3 upload only, then Archimedes
+# compiles and either pushes or opens a PR.
 steps:
   - trigger: apache-lucene-build-snapshot
     label: Trigger pipeline to build lucene snapshot
@@ -21,6 +24,12 @@ steps:
       buildDirectory: /dev/shm/bk
   - wait
   - trigger: "elasticsearch-lucene-snapshot-tests"
+    if: build.env("TARGET_BRANCH") == null || build.env("TARGET_BRANCH") == ""
     build:
       branch: "${BUILDKITE_BRANCH}"
     async: true
+
+  - label: ":robot_face: trigger lucene-snapshot-update"
+    if: build.env("TARGET_BRANCH") != null && build.env("TARGET_BRANCH") != ""
+    command: .buildkite/scripts/lucene-snapshot/trigger-snapshot-update.sh
+    timeout_in_minutes: 5
