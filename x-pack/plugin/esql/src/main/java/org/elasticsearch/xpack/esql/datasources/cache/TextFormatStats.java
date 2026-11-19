@@ -7,6 +7,7 @@
 
 package org.elasticsearch.xpack.esql.datasources.cache;
 
+import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.datasources.spi.SourceStatistics;
 
@@ -27,6 +28,13 @@ import java.util.OptionalLong;
  * statistics for every column whose name resolves to an attribute in the schema.
  */
 public final class TextFormatStats {
+
+    /**
+     * The widest text extremum a read publishes, in bytes. Every contribution a scan stages, and every record
+     * the statistics store keeps, carries a copy of both extrema of every harvested column, so without a limit
+     * one long value in each column sets the size of all of them.
+     */
+    static final int MAX_EXTREMUM_BYTES = 1024;
 
     private TextFormatStats() {}
 
@@ -132,13 +140,31 @@ public final class TextFormatStats {
 
             @Override
             public Optional<Object> minValue() {
-                return Optional.ofNullable(cs.min());
+                return Optional.ofNullable(publishable(cs.min()));
             }
 
             @Override
             public Optional<Object> maxValue() {
-                return Optional.ofNullable(cs.max());
+                return Optional.ofNullable(publishable(cs.max()));
             }
         };
+    }
+
+    /**
+     * {@code extremum}, or {@code null} when it is wider than {@link #MAX_EXTREMUM_BYTES}. The limit is on
+     * the stored {@link BytesRef}, so it covers {@code KEYWORD}, {@code TEXT} and {@code IP} alike; an
+     * address is 16 bytes and never reaches it. Counts are unaffected, and so is the other end of the same
+     * column — a withheld end is answered by a scan, and a fold marks that end unservable rather than
+     * answer it from the reads that did publish one.
+     * <p>
+     * This is the publish side. {@link #build} calls its parameter {@code cachedStats}, but what it is
+     * handed is a measurement the current read just made; a retained record is read back through
+     * {@code SourceStatisticsSerializer}'s flat map, which does not come through here. So a wide extremum
+     * already in the store is served until its entry turns over.
+     */
+    static Object publishable(Object extremum) {
+        assert extremum == null || extremum instanceof BytesRef || extremum instanceof Number
+            : "a text extremum reaches the cap as a BytesRef; [" + extremum.getClass().getName() + "] would pass uncapped";
+        return extremum instanceof BytesRef bytes && bytes.length > MAX_EXTREMUM_BYTES ? null : extremum;
     }
 }
