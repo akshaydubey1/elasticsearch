@@ -120,7 +120,8 @@ public class EncryptionPlugin extends Plugin
             pekService,
             pekEncryption,
             handlerRegistry,
-            coordinator::nodesWithoutPassword
+            coordinator::nodesWithoutPassword,
+            persistsClusterState
         );
 
         this.coordinator.set(coordinator);

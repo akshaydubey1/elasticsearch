@@ -117,7 +117,7 @@ A node rewraps its copy the next time it writes changed cluster metadata to disk
 The `cluster_state_encryption` health indicator reports on the status of the cluster state encryption:
 
 * **Green**: encryption is either working normally, or hasn't been configured (which is expected on most self-managed clusters that haven't set a password).
-* **Yellow**: a password is missing where one is required, a node can't persist the key to disk, the elected master is waiting for nodes without a password before it creates the key, or the elected master holds no key and nothing is encrypted yet.
+* **Yellow**: a master-eligible or data node has no usable password once the key exists, so it can't persist the key to disk, the elected master is waiting for nodes without a password before it creates the key, or the elected master holds no key and nothing is encrypted yet.
 * **Red**: the elected master holds no key and encrypted secrets are stored. They can't be decrypted until the key is back.
 
 The health report is calculated by the node that receives the request. Only the elected master knows which nodes it's waiting for: send the request to the elected master to see them in `nodes_without_password`.

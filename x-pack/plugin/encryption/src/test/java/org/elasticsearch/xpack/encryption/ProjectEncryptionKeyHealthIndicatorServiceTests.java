@@ -95,13 +95,25 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
         List<EncryptedDataHandler<?>> handlers,
         Set<String> nodesWithoutPassword
     ) {
+        return indicator(state, pekService, pekEncryption, handlers, nodesWithoutPassword, true);
+    }
+
+    private static ProjectEncryptionKeyHealthIndicatorService indicator(
+        ClusterState state,
+        ProjectEncryptionKeyService pekService,
+        PasswordPekEncryption pekEncryption,
+        List<EncryptedDataHandler<?>> handlers,
+        Set<String> nodesWithoutPassword,
+        boolean persistsClusterState
+    ) {
         return new ProjectEncryptionKeyHealthIndicatorService(
             mockClusterService(state),
             DefaultProjectResolver.INSTANCE,
             pekService,
             pekEncryption,
             new EncryptedDataHandlerRegistry(handlers),
-            () -> nodesWithoutPassword
+            () -> nodesWithoutPassword,
+            persistsClusterState
         );
     }
 
@@ -227,6 +239,22 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
         assertEquals(ProjectEncryptionKeyHealthIndicatorService.WRAP_FAILURE_IMPACTS, result.impacts());
     }
 
+    /** A node that doesn't persist cluster state, such as a coordinating-only node, doesn't need a password. */
+    public void testGreenWithoutPasswordOnNodeThatDoesNotPersistClusterState() {
+        ProjectEncryptionKeyHealthIndicatorService indicator = indicator(
+            stateWith(pekMetadata(PASSWORD_ID)),
+            mockPekService(EncryptionServiceState.READY, null),
+            new PasswordPekEncryption(() -> Settings.EMPTY),
+            List.of(),
+            Set.of(),
+            false
+        );
+
+        HealthIndicatorResult result = indicator.calculate(false, 1, HealthInfo.EMPTY_HEALTH_INFO);
+        assertEquals(HealthStatus.GREEN, result.status());
+        assertEquals(ProjectEncryptionKeyHealthIndicatorService.GREEN_HEALTHY, result.symptom());
+    }
+
     /** The elected master holds no key: red if any handler holds encrypted data, which can't be decrypted until the key is back. */
     public void testElectedMasterHoldsNoKey() {
         ProjectEncryptionKeyMetadata metadata = pekMetadata(PASSWORD_ID);
@@ -262,22 +290,6 @@ public class ProjectEncryptionKeyHealthIndicatorServiceTests extends ESTestCase 
         assertEquals(ProjectEncryptionKeyHealthIndicatorService.MASTER_HAS_NO_KEY, result.symptom());
         assertEquals(1, result.diagnosisList().size());
         assertEquals(ProjectEncryptionKeyHealthIndicatorService.DECRYPTION_FAILED_DEFINITION, result.diagnosisList().get(0).definition());
-        assertEquals(ProjectEncryptionKeyHealthIndicatorService.ENCRYPTION_UNAVAILABLE_IMPACTS, result.impacts());
-    }
-
-    public void testYellowWhenMissingPassword() {
-        ClusterState state = stateWith(null);
-
-        ProjectEncryptionKeyHealthIndicatorService indicator = indicator(
-            state,
-            mockPekService(EncryptionServiceState.UNAVAILABLE_MISSING_PASSWORD, null)
-        );
-
-        HealthIndicatorResult result = indicator.calculate(true, 1, HealthInfo.EMPTY_HEALTH_INFO);
-        assertEquals(HealthStatus.YELLOW, result.status());
-        assertEquals(ProjectEncryptionKeyHealthIndicatorService.YELLOW_MISSING_PASSWORD, result.symptom());
-        assertEquals(1, result.diagnosisList().size());
-        assertEquals(ProjectEncryptionKeyHealthIndicatorService.MISSING_PASSWORD_DEFINITION, result.diagnosisList().get(0).definition());
         assertEquals(ProjectEncryptionKeyHealthIndicatorService.ENCRYPTION_UNAVAILABLE_IMPACTS, result.impacts());
     }
 

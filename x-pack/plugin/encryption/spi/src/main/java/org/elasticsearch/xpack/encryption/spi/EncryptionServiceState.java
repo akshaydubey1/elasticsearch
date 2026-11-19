@@ -24,12 +24,6 @@ public enum EncryptionServiceState {
     DISABLED("disabled"),
 
     /**
-     * An active password id is configured, but no matching {@code cluster.state.encryption.password.<id>} secure setting is present. The
-     * operator must provision the matching password material.
-     */
-    UNAVAILABLE_MISSING_PASSWORD("unavailable: missing_password"),
-
-    /**
      * The elected master could not decrypt its persisted project encryption key and published cluster state without it. It gets the key
      * back from its own disk once it has the password, or another master-eligible node that can read its copy is elected after a
      * restart; the reset API is the last resort if no node can.
@@ -55,8 +49,6 @@ public enum EncryptionServiceState {
             case READY -> "";
             case DISABLED -> "Configure cluster.state.encryption.active_password_id and the matching"
                 + " cluster.state.encryption.password.<id> in the keystore.";
-            case UNAVAILABLE_MISSING_PASSWORD -> "Provision the matching cluster.state.encryption.password.<id> in the keystore"
-                + " and call POST /_nodes/reload_secure_settings (stateful).";
             case UNAVAILABLE_DECRYPTION_FAILED -> "The elected master holds no encryption key and cannot read the key on its disk."
                 + " Check the cluster_state_encryption health indicator for details.";
         };
