@@ -435,6 +435,9 @@ public class TransportEsqlStreamQueryActionTests extends ESTestCase {
             0,
             0,
             0,
+            0,
+            0,
+            0,
             List.of(),
             List.of(),
             Map.of(),
@@ -450,6 +453,9 @@ public class TransportEsqlStreamQueryActionTests extends ESTestCase {
     public void testFooterWarningsFromCompletionInfoOnly() {
         ThreadContext threadContext = new ThreadContext(Settings.EMPTY);
         DriverCompletionInfo completionInfo = new DriverCompletionInfo(
+            0,
+            0,
+            0,
             0,
             0,
             0,
@@ -481,6 +487,9 @@ public class TransportEsqlStreamQueryActionTests extends ESTestCase {
         ThreadContext threadContext = new ThreadContext(Settings.EMPTY);
         threadContext.addResponseHeader("Warning", HeaderWarning.formatWarning(sharedWarning));
         DriverCompletionInfo completionInfo = new DriverCompletionInfo(
+            0,
+            0,
+            0,
             0,
             0,
             0,
@@ -686,6 +695,9 @@ public class TransportEsqlStreamQueryActionTests extends ESTestCase {
             50,
             200,
             300,
+            0,
+            0,
+            0,
             List.of(),
             List.of(),
             Map.of(),
@@ -710,6 +722,9 @@ public class TransportEsqlStreamQueryActionTests extends ESTestCase {
         threadContext.addResponseHeader("Warning", HeaderWarning.formatWarning("limit warning"));
 
         DriverCompletionInfo completedWork = new DriverCompletionInfo(
+            0,
+            0,
+            0,
             0,
             0,
             0,
@@ -751,6 +766,9 @@ public class TransportEsqlStreamQueryActionTests extends ESTestCase {
             0,
             0,
             0,
+            0,
+            0,
+            0,
             List.of(),
             List.of(),
             Map.of(),
@@ -770,7 +788,7 @@ public class TransportEsqlStreamQueryActionTests extends ESTestCase {
     }
 
     private static DriverCompletionInfo usageWithBytesRead(long bytesRead) {
-        return new DriverCompletionInfo(0, 0, 0, bytesRead, 0, 0, 0, 0, List.of(), List.of(), Map.of(), false, false, Set.of());
+        return new DriverCompletionInfo(0, 0, 0, bytesRead, 0, 0, 0, 0, 0, 0, 0, List.of(), List.of(), Map.of(), false, false, Set.of());
     }
 
     /**
