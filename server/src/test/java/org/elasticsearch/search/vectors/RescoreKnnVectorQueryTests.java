@@ -372,7 +372,7 @@ public class RescoreKnnVectorQueryTests extends ESTestCase {
                 return format;
             }
         });
-        try (IndexWriter w = new IndexWriter(d, newIndexWriterConfig())) {
+        try (IndexWriter w = new IndexWriter(d, iwc)) {
             for (int i = 0; i < numDocs; i++) {
                 Document document = new Document();
                 float[] vector = randomFloatVector(numDims);
