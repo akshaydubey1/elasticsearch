@@ -35,6 +35,7 @@ import org.elasticsearch.index.codec.vectors.diskbbq.IvfSegmentConfig;
 import org.elasticsearch.index.codec.vectors.diskbbq.PrefetchingCentroidIterator;
 import org.elasticsearch.lucene.store.MemorySegmentAccessInputAccess;
 import org.elasticsearch.search.vectors.ESAcceptDocs;
+import org.elasticsearch.search.vectors.SharedQueryTransforms;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -245,6 +246,14 @@ public class ESNextDiskASHVectorsReader extends IVFVectorsReader<ESNextDiskASHVe
         return fields.get(fieldInfo.number).ashBitsPerDim();
     }
 
+    /**
+     * Returns the number of named slices the given field has centroids for in this segment, for tests: -1 if the segment
+     * is not sliced, 0 if it is a single flat posting list.
+     */
+    int getNumSlicesForTest(FieldInfo fieldInfo) {
+        return fields.get(fieldInfo.number).numSlices();
+    }
+
     @Override
     public PostingVisitor getPostingVisitor(
         FieldInfo fieldInfo,
@@ -266,6 +275,10 @@ public class ESNextDiskASHVectorsReader extends IVFVectorsReader<ESNextDiskASHVe
                 yield widened;
             }
         };
+        // ASH does not build an IVF structure for byte vectors today, so byte queries are searched over the raw vectors
+        // and do not get here; should it, a widened byte query has the same values in every segment, so it can share
+        // projections as a float query does
+        SharedQueryTransforms sharedTransforms = queryTarget.sharedTransforms();
 
         var ashMatrix = getAshProjectionMatrix(fieldInfo);
         int dimension = fieldInfo.getVectorDimension();
@@ -314,7 +327,8 @@ public class ESNextDiskASHVectorsReader extends IVFVectorsReader<ESNextDiskASHVe
                 centroidReader,
                 values,
                 startDoc,
-                endDoc
+                endDoc,
+                sharedTransforms
             );
         }
         return AshPostingsVisitor.create(
@@ -325,7 +339,8 @@ public class ESNextDiskASHVectorsReader extends IVFVectorsReader<ESNextDiskASHVe
             needsScoring,
             entry.ashBitsPerDim(),
             queryBitsPerDim,
-            centroidReader
+            centroidReader,
+            sharedTransforms
         );
     }
 
@@ -413,7 +428,7 @@ public class ESNextDiskASHVectorsReader extends IVFVectorsReader<ESNextDiskASHVe
             fieldInfo,
             values,
             entry.postingListSlice(ivfClusters.clone()),
-            new QueryTarget.FloatQuery(query),
+            new QueryTarget.FloatQuery(query, SharedQueryTransforms.NONE),
             null,
             entry.centroidSlice(ivfCentroids.clone()),
             acceptDocs
