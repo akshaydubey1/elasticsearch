@@ -79,6 +79,7 @@ import org.elasticsearch.xpack.esql.datasources.spi.FormatReader;
 import org.elasticsearch.xpack.esql.datasources.spi.HeapEstimates;
 import org.elasticsearch.xpack.esql.datasources.spi.PassThroughRowPositionStrategy;
 import org.elasticsearch.xpack.esql.datasources.spi.RecordSplitter;
+import org.elasticsearch.xpack.esql.datasources.spi.RowLocation;
 import org.elasticsearch.xpack.esql.datasources.spi.RowPositionStrategy;
 import org.elasticsearch.xpack.esql.datasources.spi.SegmentableFormatReader;
 import org.elasticsearch.xpack.esql.datasources.spi.SimpleSourceMetadata;
@@ -428,8 +429,19 @@ public class CsvFormatReader implements SegmentableFormatReader {
     static final String CONFIG_SCHEMA_MAX_FIELDS = "schema_max_fields";
     static final String CONFIG_MULTILINE_FIELDS = "multiline_fields";
 
+    /**
+     * The format's name as a user-facing message spells it. This reader serves {@code tsv} as well as
+     * {@code csv}, so every message that names the format takes it from here rather than hard-coding one:
+     * a hard-coded {@code "CSV"} told someone querying a {@code .tsv} about a format they never mentioned.
+     */
+    static String displayName(String format) {
+        return format.toUpperCase(Locale.ROOT);
+    }
+
     /** Context prefix {@link ExternalFailures#surface} puts on an I/O failure of the record iterator. */
-    static final String READ_RECORD_FAILURE = "Failed to read CSV record";
+    static String readRecordFailure(String format) {
+        return "Failed to read " + displayName(format) + " record";
+    }
 
     /**
      * The start of Jackson's {@code StreamReadConstraints.maxStringLength} violation message. Jackson formats the numbers
@@ -1364,7 +1376,7 @@ public class CsvFormatReader implements SegmentableFormatReader {
             if (seen.add(name) == false) {
                 throw new IllegalArgumentException(
                     "the header of ["
-                        + object.path().objectName()
+                        + RowLocation.displayObjectName(object.path().objectName())
                         + "] has duplicate column name ["
                         + ErrorExcerpts.summarize(name)
                         + "]; columns cannot bind by name"
@@ -1701,7 +1713,7 @@ public class CsvFormatReader implements SegmentableFormatReader {
 
     private InferredSchema readSchema(StorageObject object, Consumer<String> warningSink, Consumer<WidenedColumn> widenedColumnSink)
         throws IOException {
-        String sourceLocation = object.path().objectName();
+        String sourceLocation = RowLocation.displayObjectName(object.path().objectName());
         InputStream stream = object.newStream();
         // Abort rather than close: providers like S3 drain remaining bytes on close() to reuse
         // the connection. We read only the schema prefix of what may be a multi-GB file, so
@@ -1716,24 +1728,22 @@ public class CsvFormatReader implements SegmentableFormatReader {
             }
             String headerLine = consumeHeaderLine(recordReader);
             if (headerLine == null) {
-                // Names the format the user asked for, not the reader's class. This reader serves tsv as well as
-                // csv, so a hard-coded "CSV" told someone querying a .tsv about a format they never mentioned.
+                // Names the format the user asked for, not the reader's class — see displayName.
                 // Includes the object name when known so the user can identify which file in a glob caused the error.
-                String objectPart = sourceLocation.isEmpty() ? "" : " [" + sourceLocation + "]";
                 throw new IOException(
-                    format.toUpperCase(Locale.ROOT)
+                    displayName(format)
                         + " file"
-                        + objectPart
+                        + objectClause("", sourceLocation)
                         + " has no schema line: the object is empty or contains only comments"
                 );
             }
             List<Attribute> typedSchema = parseSchema(headerLine);
             if (typedSchema != null) {
-                checkUniqueAttributeNames(typedSchema);
+                checkUniqueAttributeNames(typedSchema, format);
                 return new InferredSchema(typedSchema, 0L, 0);
             }
             InferredSchema inferred = inferSchemaFromSample(headerLine, recordReader, sourceLocation, warningSink, widenedColumnSink);
-            checkUniqueAttributeNames(inferred.schema());
+            checkUniqueAttributeNames(inferred.schema(), format);
             return inferred;
         }
     }
@@ -1776,7 +1786,9 @@ public class CsvFormatReader implements SegmentableFormatReader {
             effectivePolicy,
             recordReader,
             0L,
-            schemaSampleBytes
+            schemaSampleBytes,
+            format,
+            sourceLocation
         );
         try {
             maybeHintUndecodedNullMarker(sample.rows(), sourceLocation, warningSink);
@@ -1813,11 +1825,13 @@ public class CsvFormatReader implements SegmentableFormatReader {
             effectivePolicy,
             recordReader,
             0L,
-            schemaSampleBytes
+            schemaSampleBytes,
+            format,
+            sourceLocation
         );
         try {
             if (sample.rows().isEmpty()) {
-                throw new IOException("CSV file has no data rows");
+                throw new IOException(displayName(format) + " file" + objectClause("", sourceLocation) + " has no data rows");
             }
             maybeHintUndecodedNullMarker(sample.rows(), sourceLocation, warningSink);
             int columns = syntheticColumnCount(sample.rows());
@@ -1930,8 +1944,8 @@ public class CsvFormatReader implements SegmentableFormatReader {
      * Build a schema for a headerless CSV: count the widest sample row, synthesize names from
      * {@code prefix}, and run type inference. Pure on its inputs — does not touch the circuit
      * breaker. Both call sites must guarantee {@code sampleRows} is non-empty (and surface the
-     * user-facing "CSV file has no data rows" {@link IOException} themselves); the assertion is
-     * just a programmer-error guard.
+     * user-facing "&lt;format&gt; file [object] has no data rows" {@link IOException} themselves); the
+     * assertion is just a programmer-error guard.
      */
     /**
      * A headerless sample has as many columns as its widest row, not as its first — rows are copied at
@@ -1978,7 +1992,7 @@ public class CsvFormatReader implements SegmentableFormatReader {
      * Without this guard the optimizer's {@code PlanConsistencyChecker} would later 500 with a
      * "duplicate output attribute" error that is hard to map back to the CSV input.
      */
-    private static void checkUniqueAttributeNames(List<Attribute> attributes) {
+    private static void checkUniqueAttributeNames(List<Attribute> attributes, String format) {
         Set<String> seen = new HashSet<>(attributes.size());
         LinkedHashSet<String> duplicates = null;
         for (Attribute a : attributes) {
@@ -2003,7 +2017,8 @@ public class CsvFormatReader implements SegmentableFormatReader {
                 ""
             );
             headerEx.setDetail(
-                "CSV header has duplicate column names "
+                displayName(format)
+                    + " header has duplicate column names "
                     + ErrorExcerpts.summarize(rendered.toString())
                     + "; if the file has no header row, set header_row=false"
             );
@@ -2160,9 +2175,12 @@ public class CsvFormatReader implements SegmentableFormatReader {
         String commentPrefix,
         int sampleSize,
         CircuitBreaker breaker,
-        ErrorPolicy policy
+        ErrorPolicy policy,
+        String format
     ) {
-        return collectSampleRows(csvIterator, commentPrefix, sampleSize, breaker, policy, null, 0L, Long.MAX_VALUE);
+        // No object in scope on this overload, so its errors name none; the production sites all use the
+        // variant below, which carries one.
+        return collectSampleRows(csvIterator, commentPrefix, sampleSize, breaker, policy, null, 0L, Long.MAX_VALUE, format, "");
     }
 
     /**
@@ -2183,7 +2201,9 @@ public class CsvFormatReader implements SegmentableFormatReader {
         ErrorPolicy policy,
         CsvLogicalRecordReader recordReader,
         long splitStartByte,
-        long maxSampleBytes
+        long maxSampleBytes,
+        String format,
+        String sourceLocation
     ) {
         List<String[]> sampleRows = new ArrayList<>();
         boolean trackOffsets = recordReader != null;
@@ -2252,7 +2272,7 @@ public class CsvFormatReader implements SegmentableFormatReader {
                         // Single point of truth for FAIL_FAST: same exception type and hint as
                         // the data-row path so users see consistent error messages whether
                         // sampling or reading actually tripped the failure.
-                        throw failFastSamplingError(totalRowCount, e);
+                        throw failFastSamplingError(totalRowCount, e, format, sourceLocation);
                     }
                     consecutiveFailures++;
                     if (firstCause == null) {
@@ -2262,10 +2282,18 @@ public class CsvFormatReader implements SegmentableFormatReader {
                         capturedErrors = new ArrayList<>(MAX_CAPTURED_SAMPLING_ERRORS);
                     }
                     if (capturedErrors.size() < MAX_CAPTURED_SAMPLING_ERRORS) {
-                        capturedErrors.add(rowErrorReason(e.getMessage()));
+                        capturedErrors.add(rowErrorReason(e.getMessage(), format));
                     }
                     if (policy.isBudgetExceeded(errorCount, totalRowCount)) {
-                        throw budgetExceededSamplingError(errorCount, totalRowCount, policy, capturedErrors, firstCause);
+                        throw budgetExceededSamplingError(
+                            errorCount,
+                            totalRowCount,
+                            policy,
+                            capturedErrors,
+                            firstCause,
+                            format,
+                            sourceLocation
+                        );
                     }
                     if (consecutiveFailures >= MAX_CONSECUTIVE_SAMPLING_FAILURES) {
                         // Jackson cannot resync; bail with whatever we have. If we have at least
@@ -2280,13 +2308,16 @@ public class CsvFormatReader implements SegmentableFormatReader {
                 if (recordReader != null && sampledBefore == 0 && sampleRows.size() == 1) {
                     Check.clientError(
                         recordReader.lastRecordBytes() <= maxSampleBytes,
-                        "schema inference reached the decoded-byte sample limit [{}] before reading a complete record; declare a schema",
+                        "{} schema inference{} reached the decoded-byte sample limit [{}] before reading a complete "
+                            + "record; declare a schema",
+                        displayName(format),
+                        objectClause(" of", sourceLocation),
                         ByteSizeValue.ofBytes(maxSampleBytes)
                     );
                 }
             }
             if (sampleRows.isEmpty() && capturedErrors != null) {
-                throw zeroRowsSamplingError(capturedErrors, firstCause);
+                throw zeroRowsSamplingError(capturedErrors, firstCause, format, sourceLocation);
             }
             success = true;
             long[] offsets = null;
@@ -2304,7 +2335,20 @@ public class CsvFormatReader implements SegmentableFormatReader {
         }
     }
 
-    private static ExternalClientException failFastSamplingError(long row, Throwable cause) {
+    /**
+     * The bracketed object part a schema-path message carries, with {@code leadIn} ({@code " of"},
+     * {@code " for"}, or empty where the sentence already supplies the word) so the whole phrase disappears
+     * together when the name is
+     * unavailable rather than leaving a dangling preposition. One owner because the four messages that take it
+     * must agree: three of them named no object at all, so a single bad file in a glob failed the query with a
+     * message saying only which format it was. {@link RowLocation#displayObjectName} has already been applied
+     * to what arrives here, so this neither caps nor escapes.
+     */
+    private static String objectClause(String leadIn, String sourceLocation) {
+        return sourceLocation == null || sourceLocation.isEmpty() ? "" : leadIn + " [" + sourceLocation + "]";
+    }
+
+    private static ExternalClientException failFastSamplingError(long row, Throwable cause, String format, String sourceLocation) {
         Exception e = cause instanceof Exception ex ? ex : null;
         ExternalClientException result = new ExternalClientException(
             ExternalException.Condition.MALFORMED_DATA,
@@ -2314,10 +2358,13 @@ public class CsvFormatReader implements SegmentableFormatReader {
             e
         );
         result.setDetail(
-            "CSV schema sampling failed at row ["
+            displayName(format)
+                + " schema sampling failed at row ["
                 + row
-                + "]: "
-                + rowErrorReason(cause != null ? cause.getMessage() : "(no message)")
+                + "]"
+                + objectClause(" of", sourceLocation)
+                + ": "
+                + rowErrorReason(cause != null ? cause.getMessage() : "(no message)", format)
                 + "; set [error_mode] to [skip_row] to skip the row instead"
         );
         return result;
@@ -2328,10 +2375,18 @@ public class CsvFormatReader implements SegmentableFormatReader {
         long rowCount,
         ErrorPolicy policy,
         List<String> capturedErrors,
-        Throwable firstCause
+        Throwable firstCause,
+        String format,
+        String sourceLocation
     ) {
         Exception cause = firstCause instanceof Exception ex ? ex : null;
-        StringBuilder details = new StringBuilder("schema sampling: [").append(errorCount)
+        // The fifth schema-path message, and the last to name only itself: its two siblings grew a format and an
+        // object here, so a glob tripping the sampling budget said less about where it failed than a glob
+        // tripping any of the others.
+        StringBuilder details = new StringBuilder(displayName(format)).append(" schema sampling")
+            .append(objectClause(" of", sourceLocation))
+            .append(": [")
+            .append(errorCount)
             .append("] errors in [")
             .append(rowCount)
             .append("] rows, ")
@@ -2351,13 +2406,13 @@ public class CsvFormatReader implements SegmentableFormatReader {
 
     /**
      * The reason clause of a row the reader could not parse: the cause message without the
-     * {@link #READ_RECORD_FAILURE} prefix the record iterator adds, capped by {@link ErrorExcerpts#summarize}.
+     * {@link #readRecordFailure} prefix the record iterator adds, capped by {@link ErrorExcerpts#summarize}.
      * Jackson's over-{@code max_field_size} message is rendered as {@link #fieldSizeExceededDetail}, so the
      * Jackson arm and the house tokenizer report an over-long field in the same words. Any other message loses its
      * {@link #JACKSON_CONSTRAINT_REFERENCE}.
      */
-    static String rowErrorReason(String message) {
-        String prefix = READ_RECORD_FAILURE + ": ";
+    static String rowErrorReason(String message, String format) {
+        String prefix = readRecordFailure(format) + ": ";
         String reason = message != null && message.startsWith(prefix) ? message.substring(prefix.length()) : message;
         if (reason != null) {
             Matcher tooLong = JACKSON_FIELD_TOO_LONG.matcher(reason);
@@ -2374,9 +2429,18 @@ public class CsvFormatReader implements SegmentableFormatReader {
         return "cannot read [" + ErrorExcerpts.summarize(value) + "] as [" + type.typeName() + "]";
     }
 
-    private static ExternalClientException zeroRowsSamplingError(List<String> capturedErrors, Throwable firstCause) {
+    private static ExternalClientException zeroRowsSamplingError(
+        List<String> capturedErrors,
+        Throwable firstCause,
+        String format,
+        String sourceLocation
+    ) {
         Exception cause = firstCause instanceof Exception ex ? ex : null;
-        StringBuilder details = new StringBuilder("CSV schema inference failed: no rows could be parsed; first errors: ");
+        // The object goes AFTER "failed" so that phrase stays contiguous: a test pinned it as one
+        // substring, and splitting it is a silent break for anything else matching the same way.
+        StringBuilder details = new StringBuilder(displayName(format)).append(" schema inference failed")
+            .append(objectClause(" for", sourceLocation))
+            .append(": no rows could be parsed; first errors: ");
         appendCapturedErrors(details, capturedErrors);
         ExternalClientException zeroEx = new ExternalClientException(
             ExternalException.Condition.MALFORMED_DATA,
@@ -2581,7 +2645,8 @@ public class CsvFormatReader implements SegmentableFormatReader {
         HeaderBinding headerBinding = null;
         if (logger.isDebugEnabled()) {
             logger.debug(
-                "CSV read [{}]: readSchema={}, firstSplit={}, recordAligned={}, projection={}",
+                "{} read [{}]: readSchema={}, firstSplit={}, recordAligned={}, projection={}",
+                displayName(format),
                 object.path(),
                 readSchema == null ? "null" : "present(" + readSchema.size() + ")",
                 context.firstSplit(),
@@ -2730,6 +2795,11 @@ public class CsvFormatReader implements SegmentableFormatReader {
             cacheable ? stream : null,
             pinnedMtimeMillis,
             chunkMode,
+            // From context.recordAligned() rather than chunkMode: chunkMode is demoted to false above when the
+            // object has no last-modified time, which is about cache participation and says nothing about the
+            // byte axis. Reading the demoted value suppressed a correct byte on a record-aligned chunk of an
+            // object served without Last-Modified.
+            (context.recordAligned() || context.splitStartByte() == 0L) ? context.splitStartByte() : RowLocation.BYTE_UNKNOWN,
             context.readCounters() instanceof CsvReaderCounters c ? c : null,
             useDirectBlockPlain,
             useDirectBlockQuoted,
@@ -2915,7 +2985,7 @@ public class CsvFormatReader implements SegmentableFormatReader {
             }
             throw new IllegalStateException(
                 "headered read of ["
-                    + object.path().objectName()
+                    + RowLocation.displayObjectName(object.path().objectName())
                     + "] reached a non-first split without the file's header columns; cannot bind the schema by name"
             );
         }
@@ -3098,7 +3168,9 @@ public class CsvFormatReader implements SegmentableFormatReader {
                     "",
                     ""
                 );
-                schemaEx.setDetail("Invalid CSV schema format: [" + ErrorExcerpts.summarize(column) + "]. Expected 'name:type'");
+                schemaEx.setDetail(
+                    "Invalid " + displayName(format) + " schema format: [" + ErrorExcerpts.summarize(column) + "]. Expected 'name:type'"
+                );
                 throw schemaEx;
             }
             String name = options.quoting() ? unquoteHeaderName(parts[0], options.quoteChar()) : parts[0].trim();
@@ -4065,7 +4137,7 @@ public class CsvFormatReader implements SegmentableFormatReader {
                 eof = next == null;
                 return eof == false;
             } catch (IOException e) {
-                throw surfaceReadFailure(e, READ_RECORD_FAILURE);
+                throw surfaceReadFailure(e, readRecordFailure(format));
             }
         }
 
@@ -4127,7 +4199,7 @@ public class CsvFormatReader implements SegmentableFormatReader {
                     } else if (token.isScalarValue()) {
                         row.add(decodeFieldValue(parser.getValueAsString()));
                     } else if (token != JsonToken.START_ARRAY && token != JsonToken.END_ARRAY) {
-                        throw new IOException("Unexpected CSV token [" + token + "] while parsing record");
+                        throw new IOException("Unexpected " + displayName(format) + " token [" + token + "] while parsing record");
                     }
                 }
                 return row.isEmpty() ? null : row;
@@ -4442,6 +4514,18 @@ public class CsvFormatReader implements SegmentableFormatReader {
          * emitted record. Same role as NDJSON's {@code recordOffsetBase}.
          */
         private final long splitStartByte;
+        /**
+         * The byte a message may tell the user the ordinal was counted from, or {@link RowLocation#BYTE_UNKNOWN}
+         * when this reader cannot vouch for one. It is NOT {@link #splitStartByte}: on a block-aligned split of a
+         * splittable compressed object ({@code recordAligned == false}, which {@code Bzip2DecompressionCodec} and
+         * {@code FileSplitProvider.tryBlockAlignedSplits} reach in production) that value is a boundary in the
+         * COMPRESSED file, while the ordinal counts decompressed records — the axis invariant stated above the
+         * read dispatch. This reader also discards a leading partial record on that arm, so the split start sits
+         * inside a record the previous split already reported. Either alone makes the byte a wrong instruction,
+         * so the clause is withheld rather than guessed; {@code _rowPosition} keeps using {@link #splitStartByte}
+         * unchanged, because it composes per-record offsets rather than publishing the split's own.
+         */
+        private final long messageStartByte;
 
         /** Canonical-stripe grid in bytes for per-stripe stats capture; {@code <= 0} disables it. */
         private final long statsStripeSize;
@@ -4522,6 +4606,7 @@ public class CsvFormatReader implements SegmentableFormatReader {
             CountingInputStream byteCounter,
             long pinnedMtimeMillis,
             boolean chunkMode,
+            long messageStartByte,
             CsvReaderCounters counters,
             boolean directBlockPlain,
             boolean directBlockQuoted,
@@ -4550,7 +4635,8 @@ public class CsvFormatReader implements SegmentableFormatReader {
             this.datetimeFormatter = options.datetimeFormatter();
             this.bracketMultiValues = options.multiValueSyntax() == CsvFormatOptions.MultiValueSyntax.BRACKETS;
             this.sourceLocation = sourceLocation;
-            this.messageLocation = objectPath.objectName();
+            // Cut here rather than at each message; RowLocation.displayObjectName says why.
+            this.messageLocation = RowLocation.displayObjectName(objectPath.objectName());
             this.cacheableObject = cacheableObject;
             this.byteCounter = byteCounter;
             this.pinnedMtimeMillis = pinnedMtimeMillis;
@@ -4560,6 +4646,7 @@ public class CsvFormatReader implements SegmentableFormatReader {
             this.directBlockQuoted = directBlockQuoted;
             this.maxFieldChars = options.maxFieldSize() > 0 ? options.maxFieldSize() : Integer.MAX_VALUE;
             this.splitStartByte = splitStartByte;
+            this.messageStartByte = messageStartByte;
             this.statsStripeSize = statsStripeSize;
             this.statsColumnScope = statsColumnScope != null ? statsColumnScope : StripeColumnScope.PROJECTED;
             this.statsFileFinal = statsFileFinal;
@@ -4595,7 +4682,7 @@ public class CsvFormatReader implements SegmentableFormatReader {
                 }
                 return true;
             } catch (IOException e) {
-                throw surfaceReadFailure(e, "Failed to read CSV batch");
+                throw surfaceReadFailure(e, "Failed to read " + displayName(format) + " batch");
             } finally {
                 long deltaTotal = totalRowCount - startTotal;
                 long deltaErrors = errorCount - startError;
@@ -4794,7 +4881,8 @@ public class CsvFormatReader implements SegmentableFormatReader {
                 try {
                     if (modeOrdinal != ErrorPolicy.Mode.FAIL_FAST.ordinal() && errorCount > 0) {
                         logger.info(
-                            "CSV parsing completed with [{}] errors out of [{}] rows (policy: {})",
+                            "{} parsing completed with [{}] errors out of [{}] rows (policy: {})",
+                            displayName(format),
                             errorCount,
                             totalRowCount,
                             errorPolicy.mode()
@@ -5146,7 +5234,7 @@ public class CsvFormatReader implements SegmentableFormatReader {
                                     // pragma-dependent count.
                                     recordCapDropped = true;
                                 }
-                                onRowError(rowErrorReason(e.getMessage()), e, EMPTY_ROW, true);
+                                onRowError(rowErrorReason(e.getMessage(), format), e, EMPTY_ROW, true);
                             }
                         }
                     }
@@ -5267,7 +5355,9 @@ public class CsvFormatReader implements SegmentableFormatReader {
                 errorPolicy,
                 recordReader,
                 splitStartByte,
-                schemaSampleBytes
+                schemaSampleBytes,
+                format,
+                messageLocation
             );
             // Drop the per-record sampling iterator so the bulk Jackson path can pick up where the
             // sample left off. Without this reset, inferred-schema reads stay on the slow per-record
@@ -5302,7 +5392,9 @@ public class CsvFormatReader implements SegmentableFormatReader {
                 errorPolicy,
                 recordReader,
                 splitStartByte,
-                schemaSampleBytes
+                schemaSampleBytes,
+                format,
+                messageLocation
             );
             clearCsvIterator();
             if (sample.rows().isEmpty()) {
@@ -5412,7 +5504,7 @@ public class CsvFormatReader implements SegmentableFormatReader {
                         }
                     }
                     if (index == -1) {
-                        throw new EsqlIllegalArgumentException("Column not found in CSV schema: [{}]", colName);
+                        throw new EsqlIllegalArgumentException("Column not found in {} schema: [{}]", displayName(format), colName);
                     }
                     schemaPos[c] = index;
                     projectedIdx[c] = rawFieldIndex(index);
@@ -6398,7 +6490,7 @@ public class CsvFormatReader implements SegmentableFormatReader {
                         try {
                             return splitAndConvertQuoted(buf, from, to);
                         } catch (MalformedRowException e) {
-                            onRowError(rowErrorReason(e.getMessage()), e, EMPTY_ROW, true);
+                            onRowError(rowErrorReason(e.getMessage(), format), e, EMPTY_ROW, true);
                             return false;
                         }
                     }
@@ -6416,7 +6508,7 @@ public class CsvFormatReader implements SegmentableFormatReader {
                     try {
                         return splitAndConvertQuoted(buf, from, to);
                     } catch (MalformedRowException e) {
-                        onRowError(rowErrorReason(e.getMessage()), e, EMPTY_ROW, true);
+                        onRowError(rowErrorReason(e.getMessage(), format), e, EMPTY_ROW, true);
                         return false;
                     }
                 }
@@ -7721,15 +7813,17 @@ public class CsvFormatReader implements SegmentableFormatReader {
         }
 
         private void onRowErrorImpl(String message, Exception cause, String rowExcerpt, boolean structural) {
+            // Described once, for the exception, the client warning and the node log alike, following
+            // NdJsonPageDecoder.onNdjsonLineParseError. Built separately per channel, the three drifted: the
+            // response named the row and the object while the log line kept a bare ordinal, so an operator
+            // reading the log could not tell which object of a glob, or which split of one, a failure came from.
+            String description = RowLocation.of(totalRowCount, messageLocation, messageStartByte) + ": " + message;
             if (modeOrdinal == ErrorPolicy.Mode.FAIL_FAST.ordinal()) {
                 assert rowExcerpt != null : "fail_fast quotes the row, so a caller must supply its excerpt";
                 String hint = structural
                     ? "; set [error_mode] to [skip_row] to skip the row instead"
                     : "; set [error_mode] to [null_field] to return null instead";
-                throw ExternalFailures.rowError(
-                    cause,
-                    "Row [" + totalRowCount + "] of [" + messageLocation + "]: " + message + "; row: " + rowExcerpt + hint
-                );
+                throw ExternalFailures.rowError(cause, Strings.capitalize(description) + "; row: " + rowExcerpt + hint);
             }
             if (structural == false) {
                 // Reached only under SKIP_ROW: NULL_FIELD routes coercion failures to onFieldError and keeps the
@@ -7738,14 +7832,14 @@ public class CsvFormatReader implements SegmentableFormatReader {
                 projectionDependentDrop = true;
             }
             errorCount++;
-            skipWarnings.add("row [" + totalRowCount + "]: " + message);
+            skipWarnings.add(description);
             if (logErrors) {
                 logger.warn(
-                    "Skipping malformed CSV row [{}] (error {}/{}): {}",
-                    totalRowCount,
+                    "Skipping malformed {} {} (error {}/{})",
+                    displayName(format),
+                    description,
                     errorCount,
-                    errorPolicy.maxErrors(),
-                    message
+                    errorPolicy.maxErrors()
                 );
             }
             checkBudget(cause);
@@ -7753,17 +7847,16 @@ public class CsvFormatReader implements SegmentableFormatReader {
 
         private void onFieldError(String message, String value, Attribute attr) {
             errorCount++;
-            String summarizedValue = ErrorExcerpts.summarize(value);
-            skipWarnings.add("row [" + totalRowCount + "], column [" + attr.name() + "]: " + message);
+            // One description for the client warning and the node log, as onRowErrorImpl does.
+            String description = RowLocation.of(totalRowCount, messageLocation, messageStartByte, attr.name()) + ": " + message;
+            skipWarnings.add(description);
             if (logErrors) {
                 logger.warn(
-                    "Null-filling unparseable field [{}] value [{}] in row [{}] (error {}/{}): {}",
-                    attr.name(),
-                    summarizedValue,
-                    totalRowCount,
+                    "Null-filling unparseable value [{}]: {} (error {}/{})",
+                    ErrorExcerpts.summarize(value),
+                    description,
                     errorCount,
-                    errorPolicy.maxErrors(),
-                    message
+                    errorPolicy.maxErrors()
                 );
             }
             checkBudget(null);
@@ -7776,15 +7869,17 @@ public class CsvFormatReader implements SegmentableFormatReader {
          */
         private void onDroppedElements(List<String> messages, String value, Attribute attr) {
             errorCount++;
+            // The cell's location is described once and shared by every element's detail and by the log line,
+            // as onRowErrorImpl does; only the per-element reason differs between them.
+            String where = RowLocation.of(totalRowCount, messageLocation, messageStartByte, attr.name());
             for (String message : messages) {
-                skipWarnings.addRemovedFromMultiValue("row [" + totalRowCount + "], column [" + attr.name() + "]: " + message);
+                skipWarnings.addRemovedFromMultiValue(where + ": " + message);
             }
             if (logErrors) {
                 logger.warn(
-                    "Removing unparseable values from multi-valued field [{}] value [{}] in row [{}] (error {}/{}): {}",
-                    attr.name(),
+                    "Removing unparseable values from multi-valued field at {}; value [{}] (error {}/{}): {}",
+                    where,
                     ErrorExcerpts.summarize(value),
-                    totalRowCount,
                     errorCount,
                     errorPolicy.maxErrors(),
                     messages
@@ -7797,6 +7892,9 @@ public class CsvFormatReader implements SegmentableFormatReader {
             if (errorPolicy.isBudgetExceeded(errorCount, totalRowCount)) {
                 // Budget exceeded is a client-data problem (the file has too many bad rows for the
                 // user-configured tolerance), not a server bug — surface as HTTP 400.
+                // The row count is this reader's own, so it takes the window clause the per-row details take.
+                // Without it the aggregate reads as a statement about the whole object, which on a later split
+                // it is not -- the mis-location this change removes from the detail lines, left in the summary.
                 throw ExternalFailures.rowError(
                     cause,
                     "["
@@ -7805,7 +7903,9 @@ public class CsvFormatReader implements SegmentableFormatReader {
                         + totalRowCount
                         + "] rows of ["
                         + messageLocation
-                        + "]; "
+                        + "]"
+                        + RowLocation.countedIn(messageStartByte)
+                        + "; "
                         + errorPolicy.trippedLimit(errorCount)
                 );
             }

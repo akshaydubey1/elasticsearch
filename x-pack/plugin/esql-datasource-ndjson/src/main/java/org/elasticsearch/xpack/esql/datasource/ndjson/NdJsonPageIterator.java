@@ -30,6 +30,7 @@ import org.elasticsearch.xpack.esql.datasources.spi.ErrorPolicy;
 import org.elasticsearch.xpack.esql.datasources.spi.ExternalFailures;
 import org.elasticsearch.xpack.esql.datasources.spi.FormatReader;
 import org.elasticsearch.xpack.esql.datasources.spi.RecordSplitter;
+import org.elasticsearch.xpack.esql.datasources.spi.RowLocation;
 import org.elasticsearch.xpack.esql.datasources.spi.SegmentableFormatReader;
 import org.elasticsearch.xpack.esql.datasources.spi.SourceStatistics;
 import org.elasticsearch.xpack.esql.datasources.spi.StorageObject;
@@ -216,6 +217,7 @@ final class NdJsonPageIterator extends BufferingPageIterator {
         Function<List<Attribute>, String> fingerprinter,
         String readConfig,
         boolean chunkMode,
+        boolean withholdMessageStartByte,
         @Nullable NdJsonReaderCounters counters,
         long splitStartByte,
         int maxRecordBytes,
@@ -237,7 +239,7 @@ final class NdJsonPageIterator extends BufferingPageIterator {
         this.fingerprintSchema = resolvedAttributes;
         this.sourceLocation = object.path().toString();
         // sourceLocation keys stats, so it stays verbatim; user-facing messages name only the object.
-        String messageLocation = object.path().objectName();
+        String messageLocation = RowLocation.displayObjectName(object.path().objectName());
         this.chunkMode = chunkMode;
         this.statsColumnScope = statsColumnScope != null ? statsColumnScope : StripeColumnScope.PROJECTED;
         // Per-stripe stats capture is for the chunk-parallel paths (recordAligned); a whole-file read
@@ -349,6 +351,14 @@ final class NdJsonPageIterator extends BufferingPageIterator {
         }
         // _rowPosition / _file.record_ref substrate: file-global per-record start offset.
         this.pageDecoder.setRecordOffsetBase(recordOffsetBase);
+        if (withholdMessageStartByte) {
+            // A block-aligned split of a splittable compressed object: splitStartByte is a boundary in the
+            // compressed file, while the ordinal counts decompressed records. The caller decides, from
+            // context.recordAligned() rather than from chunkMode, because chunkMode is demoted when the object
+            // has no last-modified time and that says nothing about the byte axis. _rowPosition is unaffected:
+            // the operator factory null-splices its slot for a compressed-offset split.
+            this.pageDecoder.withholdMessageStartByte();
+        }
         this.pageDecoder.setMaxRecordBytes(maxRecordBytes);
         this.pageDecoder.setReportAbsentDeclaredColumns(statsFileFinal);
         if (this.statsStripeSize > 0) {
