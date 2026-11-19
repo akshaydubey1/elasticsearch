@@ -55,6 +55,7 @@ import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.features.FeatureService;
 import org.elasticsearch.index.IndexMode;
 import org.elasticsearch.index.IndexSettings;
+import org.elasticsearch.index.IndexingPressure;
 import org.elasticsearch.index.SliceIndexing;
 import org.elasticsearch.index.VersionType;
 import org.elasticsearch.index.mapper.IdFieldMapper;
@@ -144,6 +145,9 @@ public class Reindexer {
     private final TaskResultsService taskResultsService;
     private final TimeValue reindexShutdownGracePeriod;
     private final CircuitBreaker requestBreaker;
+    /** Null when this reindexer was not given the node's indexing pressure. Bulks then stay unaccounted. */
+    @Nullable
+    private final IndexingPressure indexingPressure;
 
     Reindexer(
         ClusterService clusterService,
@@ -161,6 +165,43 @@ public class Reindexer {
         TaskResultsService taskResultsService,
         CircuitBreakerService circuitBreakerService
     ) {
+        // No indexing pressure was given, so bulks stay unaccounted and the node charges each attempt.
+        this(
+            clusterService,
+            reindexSettings,
+            projectResolver,
+            client,
+            threadPool,
+            scriptService,
+            reindexSslConfig,
+            reindexMetrics,
+            bulkByPaginatedSearchSearchContextMetrics,
+            transportService,
+            relocationNodePicker,
+            featureService,
+            taskResultsService,
+            circuitBreakerService,
+            null
+        );
+    }
+
+    Reindexer(
+        ClusterService clusterService,
+        ReindexSettings reindexSettings,
+        ProjectResolver projectResolver,
+        Client client,
+        ThreadPool threadPool,
+        ScriptService scriptService,
+        ReindexSslConfig reindexSslConfig,
+        @Nullable ReindexMetrics reindexMetrics,
+        @Nullable BulkByPaginatedSearchSearchContextMetrics bulkByPaginatedSearchSearchContextMetrics,
+        TransportService transportService,
+        ReindexRelocationNodePicker relocationNodePicker,
+        FeatureService featureService,
+        TaskResultsService taskResultsService,
+        CircuitBreakerService circuitBreakerService,
+        @Nullable IndexingPressure indexingPressure
+    ) {
         this.clusterService = clusterService;
         this.reindexSettings = Objects.requireNonNull(reindexSettings);
         this.projectResolver = projectResolver;
@@ -177,6 +218,7 @@ public class Reindexer {
         this.taskResultsService = Objects.requireNonNull(taskResultsService);
         this.reindexShutdownGracePeriod = ShutdownPrepareService.MAXIMUM_REINDEXING_TIMEOUT_SETTING.get(clusterService.getSettings());
         this.requestBreaker = Objects.requireNonNull(circuitBreakerService.getBreaker(CircuitBreaker.REQUEST));
+        this.indexingPressure = indexingPressure;
     }
 
     public void initTask(BulkByPaginatedSearchTask task, ReindexRequest request, ActionListener<Void> listener) {
@@ -309,7 +351,8 @@ public class Reindexer {
                 reindexShutdownGracePeriod,
                 bulkByPaginatedSearchSearchContextMetrics,
                 reindexSettings,
-                requestBreaker
+                requestBreaker,
+                indexingPressure
             );
             searchAction.start();
         };
@@ -1014,6 +1057,45 @@ public class Reindexer {
             ReindexSettings reindexSettings,
             CircuitBreaker requestBreaker
         ) {
+            // No indexing pressure was given, so bulks stay unaccounted and the node charges each attempt.
+            this(
+                task,
+                logger,
+                searchClient,
+                bulkClient,
+                threadPool,
+                scriptService,
+                state,
+                sslConfig,
+                request,
+                listener,
+                remoteVersion,
+                maxTaskShutdownGracePeriod,
+                bulkByPaginatedSearchSearchContextMetrics,
+                reindexSettings,
+                requestBreaker,
+                null
+            );
+        }
+
+        AsyncIndexBySearchAction(
+            BulkByPaginatedSearchTask task,
+            Logger logger,
+            ParentTaskAssigningClient searchClient,
+            ParentTaskAssigningClient bulkClient,
+            ThreadPool threadPool,
+            ScriptService scriptService,
+            ProjectState state,
+            ReindexSslConfig sslConfig,
+            ReindexRequest request,
+            ActionListener<BulkByPaginatedSearchResponse> listener,
+            @Nullable Version remoteVersion,
+            TimeValue maxTaskShutdownGracePeriod,
+            @Nullable BulkByPaginatedSearchSearchContextMetrics bulkByPaginatedSearchSearchContextMetrics,
+            ReindexSettings reindexSettings,
+            CircuitBreaker requestBreaker,
+            @Nullable IndexingPressure indexingPressure
+        ) {
             super(
                 task,
                 /*
@@ -1038,7 +1120,8 @@ public class Reindexer {
                 maxTaskShutdownGracePeriod,
                 reindexSettings,
                 requestBreaker,
-                "reindex_bulk_batch"
+                "reindex_bulk_batch",
+                indexingPressure
             );
             this.destinationIndexIdMapper = destinationIndexMode(state).idTransformerForReindex();
             this.destinationSliceEnabled = SliceIndexing.SLICE_FEATURE_FLAG.isEnabled() && destinationSliceEnabled(state);
