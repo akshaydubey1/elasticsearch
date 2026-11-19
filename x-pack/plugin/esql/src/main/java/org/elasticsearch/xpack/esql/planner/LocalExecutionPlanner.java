@@ -467,6 +467,7 @@ public class LocalExecutionPlanner {
             new Holder<>(),
             new Holder<>(),
             singleNodeOptimizations,
+            Boolean.TRUE.equals(QuerySettings.DOC_PARTITIONING_FOR_WIDE_ROWS.get(configuration.resolvedSettings())),
             sortBound
         );
 
@@ -3299,6 +3300,7 @@ public class LocalExecutionPlanner {
         Holder<TopNExec> lastVisitedTopN,
         Holder<LuceneMinCompetitiveTimestampTopN> luceneMinCompetitivePilot,
         boolean singleNodeOptimizations,
+        boolean docPartitioningForWideRows,
         @Nullable SharedSortBound sortBound
     ) {
         void addDriverFactory(DriverFactory driverFactory) {
