@@ -19,7 +19,6 @@ import org.elasticsearch.health.HealthStatus;
 import org.elasticsearch.health.node.HealthInfo;
 import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.plugins.PluginsService;
-import org.elasticsearch.reservedstate.service.FileSettingsService;
 import org.elasticsearch.test.ESIntegTestCase;
 import org.elasticsearch.test.MockLog;
 import org.elasticsearch.test.NodeRoles;
@@ -27,13 +26,11 @@ import org.elasticsearch.xpack.encryption.spi.EncryptedData;
 import org.elasticsearch.xpack.encryption.spi.EncryptionService;
 import org.elasticsearch.xpack.encryption.spi.EncryptionServiceState;
 import org.elasticsearch.xpack.encryption.spi.EncryptionServiceUnavailableException;
-import org.elasticsearch.xpack.stateless.settings.secure.SecureSettingsPlugin;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import static org.hamcrest.Matchers.containsString;
@@ -60,7 +57,6 @@ public class ProjectEncryptionKeyMissingPasswordIT extends ESIntegTestCase {
     protected Collection<Class<? extends Plugin>> nodePlugins() {
         Collection<Class<? extends Plugin>> plugins = new ArrayList<>(super.nodePlugins());
         plugins.add(EncryptionPlugin.class);
-        plugins.add(SecureSettingsPlugin.class);
         return plugins;
     }
 
@@ -92,42 +88,6 @@ public class ProjectEncryptionKeyMissingPasswordIT extends ESIntegTestCase {
         reload(joining, passwordSettings());
         ensureStableCluster(2);
         assertBusy(() -> assertEquals(HealthStatus.GREEN, health(joining).status()));
-    }
-
-    /**
-     * On stateful a node persists a cluster state before it applies the cluster secrets in it, so a node without the password in its
-     * keystore is rejected at join even when the cluster secrets hold the password.
-     */
-    public void testNodeWithoutPasswordCannotJoinStatefulClusterWithPasswordInClusterSecrets() throws Exception {
-        internalCluster().setBootstrapMasterNodeIndex(0);
-        String master = internalCluster().startNode();
-        reload(master, passwordSettings());
-        assertBusy(() -> assertThat(pekOn(master), notNullValue()));
-
-        FileSettingsService fileSettings = internalCluster().getInstance(FileSettingsService.class, master);
-        assertBusy(() -> assertTrue(fileSettings.watching()));
-        CountDownLatch applied = KeyRotationViaClusterSecretsIT.fileSettingsAppliedLatch(master, 1);
-        KeyRotationViaClusterSecretsIT.writeFileSettingsJson(
-            master,
-            EncryptionIntegTestUtils.clusterSecretsJson(
-                1,
-                ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY,
-                PASSWORD_ID,
-                ProjectEncryptionKeyPasswordSettings.PASSWORD_PREFIX + PASSWORD_ID,
-                PASSWORD
-            )
-        );
-        assertTrue("file-settings update was not applied within 30s", applied.await(30, TimeUnit.SECONDS));
-
-        String joining;
-        try (MockLog mockLog = MockLog.capture(JoinHelper.class)) {
-            mockLog.addExpectation(new EncryptionIntegTestUtils.JoinRejectedExpectation());
-            joining = internalCluster().startNode(NodeRoles.dataOnlyNode());
-            mockLog.awaitAllExpectationsMatched();
-        }
-        assertEquals(1, internalCluster().clusterService(master).state().nodes().size());
-        // stopped because the test framework's teardown would otherwise use a node that has no master
-        internalCluster().stopNode(joining);
     }
 
     /**

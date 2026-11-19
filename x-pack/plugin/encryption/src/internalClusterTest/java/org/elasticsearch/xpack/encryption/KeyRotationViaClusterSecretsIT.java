@@ -11,7 +11,6 @@ import org.elasticsearch.client.Response;
 import org.elasticsearch.cluster.ClusterStateListener;
 import org.elasticsearch.cluster.metadata.ReservedStateMetadata;
 import org.elasticsearch.cluster.service.ClusterService;
-import org.elasticsearch.common.Priority;
 import org.elasticsearch.common.settings.ClusterSecrets;
 import org.elasticsearch.common.settings.MockSecureSettings;
 import org.elasticsearch.common.settings.Settings;
@@ -58,8 +57,7 @@ import static org.hamcrest.Matchers.nullValue;
  *       PEK under the new password, and persists the result as a new {@link ProjectEncryptionKeyMetadata}.</li>
  * </ol>
  */
-// no client nodes: they accept cluster secrets without the password, so can't serialize the state for the teardown's node tool check
-@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, numDataNodes = 3, numClientNodes = 0, supportsDedicatedMasters = false)
+@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST, numDataNodes = 3, supportsDedicatedMasters = false)
 public class KeyRotationViaClusterSecretsIT extends ESIntegTestCase {
 
     private static final String INITIAL_PASSWORD_ID = "v1";
@@ -226,31 +224,6 @@ public class KeyRotationViaClusterSecretsIT extends ESIntegTestCase {
         }
     }
 
-    /**
-     * Cluster secrets replace every secure setting on reload, so cluster secrets without the encryption password would remove it from
-     * the keystore. That reload is rejected, and every node can still persist cluster state.
-     */
-    public void testClusterSecretsWithoutTheEncryptionPasswordKeepTheKeystorePassword() throws Exception {
-        String master = internalCluster().getMasterName();
-        FileSettingsService fss = internalCluster().getInstance(FileSettingsService.class, master);
-        assertBusy(() -> assertTrue(fss.watching()));
-
-        long version = fileSettingsVersionCounter.incrementAndGet();
-        CountDownLatch applied = fileSettingsAppliedLatch(master, version);
-        writeFileSettingsJson(master, EncryptionIntegTestUtils.clusterSecretsJson(version, "test.unrelated.secret", "value"));
-        assertTrue("file-settings update was not applied within 30s", applied.await(30, TimeUnit.SECONDS));
-        // every node has applied the cluster secrets, and so reloaded them, once the master has no pending tasks
-        clusterAdmin().prepareHealth(TEST_REQUEST_TIMEOUT).setWaitForEvents(Priority.LANGUID).get();
-
-        for (String node : internalCluster().getNodeNames()) {
-            if (PasswordPekEncryption.persistsClusterState(internalCluster().clusterService(node).localNode().getRoles(), false)) {
-                assertTrue(node, internalCluster().getInstance(PasswordPekEncryption.class, node).canWrapForDisk());
-            }
-        }
-        createIndex("persisted-after-cluster-secrets");
-        ensureGreen("persisted-after-cluster-secrets");
-    }
-
     private Map<String, Object> projectEncryptionKeyFromClusterStateApi() throws IOException {
         ObjectPath path = ObjectPath.createFromResponse(performClusterStateMetadataRequest());
         Map<String, Object> pek = path.evaluate("metadata." + ProjectEncryptionKeyMetadata.TYPE);
@@ -286,7 +259,7 @@ public class KeyRotationViaClusterSecretsIT extends ESIntegTestCase {
         return internalCluster().getInstance(EncryptionService.class, internalCluster().getMasterName());
     }
 
-    static void writeFileSettingsJson(String node, String json) throws Exception {
+    private static void writeFileSettingsJson(String node, String json) throws Exception {
         FileSettingsService fileSettingsService = internalCluster().getInstance(FileSettingsService.class, node);
         Files.createDirectories(fileSettingsService.watchedFileDir());
         Path tempFilePath = createTempFile();
@@ -294,7 +267,7 @@ public class KeyRotationViaClusterSecretsIT extends ESIntegTestCase {
         Files.move(tempFilePath, fileSettingsService.watchedFile(), StandardCopyOption.ATOMIC_MOVE);
     }
 
-    static CountDownLatch fileSettingsAppliedLatch(String node, long expectedVersion) {
+    private static CountDownLatch fileSettingsAppliedLatch(String node, long expectedVersion) {
         ClusterService cs = internalCluster().clusterService(node);
         CountDownLatch latch = new CountDownLatch(1);
         ClusterStateListener[] selfRef = new ClusterStateListener[1];

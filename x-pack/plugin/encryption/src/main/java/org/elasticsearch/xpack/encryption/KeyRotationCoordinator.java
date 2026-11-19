@@ -556,7 +556,7 @@ class KeyRotationCoordinator implements LocalNodeMasterListener, Closeable {
             if (notReady.isEmpty() == false && notReady.equals(previouslyNotReady) == false) {
                 logger.warn(
                     "project encryption key not {} yet: nodes {} cannot persist it. Configure [{}] and the matching [{}<id>]"
-                        + " secure setting on every master-eligible and data node and reload secure settings",
+                        + " secure setting on these nodes and reload their secure settings",
                     pending,
                     notReady,
                     ProjectEncryptionKeyPasswordSettings.ACTIVE_PASSWORD_ID_KEY,

@@ -60,7 +60,7 @@ class ProjectEncryptionKeyHealthIndicatorService implements HealthIndicatorServi
     static final String MASTER_HAS_NO_KEY = "The elected master holds no cluster state encryption key; encryption is unavailable.";
     static final String YELLOW_MISSING_PASSWORD = "Cluster state encryption is degraded: no active password is configured on this node.";
     static final String YELLOW_WAITING_FOR_NODES =
-        "The cluster state encryption key is not created yet: some master-eligible or data nodes can't persist it.";
+        "The cluster state encryption key is not created yet: some nodes that persist cluster state can't persist it.";
 
     static final List<HealthIndicatorImpact> WRAP_FAILURE_IMPACTS = List.of(
         new HealthIndicatorImpact(
@@ -85,7 +85,7 @@ class ProjectEncryptionKeyHealthIndicatorService implements HealthIndicatorServi
             NAME,
             "encryption_key_waiting_for_nodes",
             2,
-            "The cluster state encryption key is not created or restored until every master-eligible and data node can persist it."
+            "The cluster state encryption key is not created or restored until every node that persists cluster state can persist it."
                 + " Until then, encrypted secrets can't be stored or read.",
             List.of(ImpactArea.DEPLOYMENT_MANAGEMENT)
         )
@@ -123,8 +123,8 @@ class ProjectEncryptionKeyHealthIndicatorService implements HealthIndicatorServi
     static final Diagnosis.Definition NODES_WITHOUT_PASSWORD_DEFINITION = new Diagnosis.Definition(
         NAME,
         "nodes_without_password",
-        "The elected master waits to create or restore the cluster state encryption key until every master-eligible and data node can"
-            + " persist it, and the nodes in nodes_without_password can't.",
+        "The elected master waits to create or restore the cluster state encryption key until every node that persists cluster state"
+            + " can persist it, and the nodes in nodes_without_password can't.",
         "Configure cluster.state.encryption.active_password_id and the matching cluster.state.encryption.password.<id> on the nodes in"
             + " nodes_without_password and reload their secure settings.",
         HELP_URL
