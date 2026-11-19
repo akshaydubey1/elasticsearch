@@ -9,8 +9,12 @@ package org.elasticsearch.compute.data;
 
 import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.index.mapper.BlockLoader;
+import org.elasticsearch.xpack.core.analytics.mapper.EncodedTDigest;
 
 public sealed interface TDigestBlock extends HistogramBlock permits ConstantNullBlock, TDigestArrayBlock {
+
+    @Override
+    LongBlock getCountBlock();
 
     static boolean equals(TDigestBlock blockA, TDigestBlock blockB) {
         if (blockA == blockB) {
@@ -46,6 +50,8 @@ public sealed interface TDigestBlock extends HistogramBlock permits ConstantNull
     }
 
     TDigestHolder getTDigestHolder(int offset, TDigestHolder scratch);
+
+    EncodedTDigest getEncodedTDigest(int valueIndex, TDigestHolder scratch);
 
     interface SerializedTDigestOutput {
         void appendDouble(double value);
